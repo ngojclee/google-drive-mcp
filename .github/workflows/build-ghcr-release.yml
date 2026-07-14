@@ -1,0 +1,130 @@
+name: Build upstream release to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream release tag to build (for example v2.3.0). Leave empty for latest."
+        required: false
+        type: string
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$REQUESTED_TAG" ]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(gh api repos/piotr-agier/google-drive-mcp/releases/latest --jq .tag_name)"
+          fi
+
+          case "$tag" in
+            v[0-9]*)
+              ;;
+            *)
+              echo "Unexpected upstream tag: $tag" >&2
+              exit 1
+              ;;
+          esac
+
+          git fetch --force --tags https://github.com/piotr-agier/google-drive-mcp.git "$tag"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          version="${tag#v}"
+          major="${version%%.*}"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip an already published immutable version
+        id: image
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ steps.upstream.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image version ${{ steps.upstream.outputs.version }} already exists."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream source
+        if: steps.image.outputs.exists != 'true'
+        run: git checkout --detach "${{ steps.upstream.outputs.commit }}"
+
+      - name: Set up Node.js
+        if: steps.image.outputs.exists != 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.image.outputs.exists != 'true'
+        run: npm ci
+
+      - name: Lint
+        if: steps.image.outputs.exists != 'true'
+        run: npm run lint
+
+      - name: Build
+        if: steps.image.outputs.exists != 'true'
+        run: npm run build
+
+      - name: Test
+        if: steps.image.outputs.exists != 'true'
+        run: npm test
+
+      - name: Set image metadata
+        if: steps.image.outputs.exists != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.version }}
+            type=raw,value=${{ steps.upstream.outputs.major }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/piotr-agier/google-drive-mcp
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.version }}
+
+      - name: Build and publish image
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
