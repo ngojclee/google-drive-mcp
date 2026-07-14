@@ -1,0 +1,116 @@
+name: Sync upstream master and build edge
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_edge:
+        description: "Build edge even when upstream master has not changed."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "5 */6 * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-upstream-and-build-edge
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      fork_sha: ${{ steps.sync.outputs.fork_sha }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Rebase fork commits onto upstream master
+        id: sync
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/piotr-agier/google-drive-mcp.git
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            changed=false
+            echo "Fork master already contains the current upstream master."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rebase upstream/master
+            git push --force-with-lease origin HEAD:master
+            changed=true
+          fi
+
+          fork_sha="$(git rev-parse HEAD)"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${fork_sha::12}" >> "$GITHUB_OUTPUT"
+
+  build-edge:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.force_edge == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out synchronized fork
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.fork_sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=edge
+            type=raw,value=edge-${{ needs.sync.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ngojclee/google-drive-mcp
+            org.opencontainers.image.revision=${{ needs.sync.outputs.fork_sha }}
+            org.opencontainers.image.version=edge-${{ needs.sync.outputs.short_sha }}
+
+      - name: Build and publish edge image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
