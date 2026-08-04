@@ -1,4 +1,4 @@
-name: Sync upstream master and build edge
+name: Build upstream master edge
 
 on:
   workflow_dispatch:
@@ -12,80 +12,49 @@ on:
     - cron: "5 */6 * * *"
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 concurrency:
-  group: sync-upstream-and-build-edge
+  group: build-upstream-master-edge
   cancel-in-progress: false
 
 jobs:
-  sync:
+  resolve-upstream:
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.sync.outputs.changed }}
-      fork_sha: ${{ steps.sync.outputs.fork_sha }}
-      short_sha: ${{ steps.sync.outputs.short_sha }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      short_sha: ${{ steps.upstream.outputs.short_sha }}
 
     steps:
-      - name: Check out fork
-        uses: actions/checkout@v5
-        with:
-          ref: master
-          fetch-depth: 0
-
-      - name: Rebase fork commits onto upstream master
-        id: sync
+      - name: Resolve upstream master
+        id: upstream
         run: |
           set -euo pipefail
 
-          git remote add upstream https://github.com/piotr-agier/google-drive-mcp.git
-          git fetch --no-tags upstream master
-
-          if git merge-base --is-ancestor upstream/master HEAD; then
-            changed=false
-            echo "Fork master already contains the current upstream master."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git rebase upstream/master
-            git push --force-with-lease origin HEAD:master
-            changed=true
-          fi
-
-          fork_sha="$(git rev-parse HEAD)"
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${fork_sha::12}" >> "$GITHUB_OUTPUT"
+          sha="$(git ls-remote --exit-code https://github.com/piotr-agier/google-drive-mcp.git refs/heads/master | awk '{print $1}')"
+          test "${#sha}" -eq 40
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha::12}" >> "$GITHUB_OUTPUT"
 
   build-edge:
-    needs: sync
-    if: needs.sync.outputs.changed == 'true' || inputs.force_edge == true
+    needs: resolve-upstream
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out synchronized fork
+      - name: Check out upstream master
         uses: actions/checkout@v5
         with:
-          ref: ${{ needs.sync.outputs.fork_sha }}
+          repository: piotr-agier/google-drive-mcp
+          ref: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+          path: upstream
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
+          cache-dependency-path: upstream/package-lock.json
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -94,23 +63,55 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check whether edge image already exists
+        id: image
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:edge-${{ needs.resolve-upstream.outputs.short_sha }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Edge image already exists for ${{ needs.resolve-upstream.outputs.upstream_sha }}."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
+        working-directory: upstream
+        run: npm ci
+
+      - name: Lint
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
+        working-directory: upstream
+        run: npm run lint
+
+      - name: Build
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
+        working-directory: upstream
+        run: npm run build
+
+      - name: Test
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
+        working-directory: upstream
+        run: npm test
+
       - name: Set image metadata
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=edge
-            type=raw,value=edge-${{ needs.sync.outputs.short_sha }}
+            type=raw,value=edge-${{ needs.resolve-upstream.outputs.short_sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/ngojclee/google-drive-mcp
-            org.opencontainers.image.revision=${{ needs.sync.outputs.fork_sha }}
-            org.opencontainers.image.version=edge-${{ needs.sync.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ needs.resolve-upstream.outputs.upstream_sha }}
+            org.opencontainers.image.version=edge-${{ needs.resolve-upstream.outputs.short_sha }}
 
       - name: Build and publish edge image
+        if: steps.image.outputs.exists != 'true' || inputs.force_edge == true
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: upstream
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
