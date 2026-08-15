@@ -9,6 +9,9 @@ const cfg = (o: Partial<RuntimeConfig> = {}): RuntimeConfig => ({
   retryMax: 0,
   retryBaseDelay: 0,
   disableResources: false,
+  maxConcurrentTools: 8,
+  maxQueuedTools: 64,
+  toolQueueTimeout: 15_000,
   ...o,
 });
 

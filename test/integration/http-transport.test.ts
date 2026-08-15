@@ -36,7 +36,7 @@ async function parseResponse(res: Response): Promise<any> {
   return JSON.parse(text);
 }
 
-async function setupMocks() {
+async function installMocks() {
   const mocks = createAllMocks();
   (google as any).drive = mocks.google.drive;
   (google as any).docs = mocks.google.docs;
@@ -48,7 +48,11 @@ async function setupMocks() {
   mod._setAuthClientForTesting({
     request: async () => ({ data: 'mock-auth-request-response' }),
   });
-  return mod;
+  return { mod, mocks };
+}
+
+async function setupMocks() {
+  return (await installMocks()).mod;
 }
 
 async function initializeSession(baseUrl: string): Promise<string> {
@@ -244,7 +248,7 @@ describe('HTTP transport', () => {
     assert.equal(res.status, 400);
   });
 
-  it('declines the optional standalone SSE stream without hanging', async () => {
+  it('keeps the optional standalone SSE stream alive', async () => {
     const sessionId = await initializeSession(baseUrl);
     const res = await fetch(`${baseUrl}/mcp`, {
       headers: {
@@ -254,10 +258,9 @@ describe('HTTP transport', () => {
       signal: AbortSignal.timeout(2_000),
     });
 
-    assert.equal(res.status, 405);
-    assert.equal(res.headers.get('allow'), 'POST, DELETE');
-    const body = await parseResponse(res);
-    assert.match(body.error?.message || '', /SSE stream is not available/);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /^text\/event-stream\b/);
+    await res.body?.cancel();
   });
 
   it('DELETE closes session', async () => {
@@ -296,6 +299,74 @@ describe('HTTP transport', () => {
     });
     // Session is gone, and it's not an initialize request, so 400
     assert.equal(postRes.status, 400);
+  });
+});
+
+describe('HTTP transport — shared concurrency limit', () => {
+  let httpServer: HttpServer;
+  let baseUrl: string;
+  let sessions: Map<string, any>;
+  let active = 0;
+  let peak = 0;
+
+  before(async () => {
+    const { mod, mocks } = await installMocks();
+    mocks.sheets.service.spreadsheets.values.get._setImpl(async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await delay(40);
+      active -= 1;
+      return { data: { values: [['ok']] } };
+    });
+    const result = mod.createHttpApp('127.0.0.1');
+    sessions = result.sessions;
+    const started = await startServer(result.app);
+    httpServer = started.httpServer;
+    baseUrl = started.baseUrl;
+  });
+
+  after(async () => {
+    await cleanupServer(httpServer, sessions);
+  });
+
+  it('bounds concurrent tool calls across multiple sessions', async () => {
+    const sessionIds = await Promise.all(
+      Array.from({ length: 4 }, () => initializeSession(baseUrl)),
+    );
+    await Promise.all(sessionIds.map((sessionId) => fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+      }),
+    })));
+
+    const responses = await Promise.all(Array.from({ length: 20 }, (_, index) => {
+      const sessionId = sessionIds[index % sessionIds.length];
+      return fetch(`${baseUrl}/mcp`, {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'tools/call',
+          params: {
+            name: 'getGoogleSheetContent',
+            arguments: { spreadsheetId: 'sheet-1', range: 'Sheet1!A1:A1' },
+          },
+          id: 100 + index,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+    }));
+
+    for (const response of responses) {
+      assert.equal(response.status, 200);
+      const body = await parseResponse(response);
+      assert.notEqual(body.result?.isError, true);
+    }
+    assert.equal(peak, 8);
+    assert.equal(active, 0);
   });
 });
 

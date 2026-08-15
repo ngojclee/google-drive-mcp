@@ -2,7 +2,26 @@ import { z } from 'zod';
 import type { sheets_v4 } from 'googleapis';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
 import { errorResponse } from '../types.js';
-import { parseA1Range, convertA1ToGridRange, escapeDriveQuery, ALL_DRIVES_LIST_PARAMS, type GridRange } from '../utils.js';
+import {
+  parseA1Range,
+  convertA1ToGridRange,
+  colToIndex,
+  escapeDriveQuery,
+  ALL_DRIVES_LIST_PARAMS,
+  type GridRange,
+} from '../utils.js';
+import { withRetry } from '../utils/retry.js';
+
+const DEFAULT_SHEET_READ_MAX_ROWS = 500;
+const DEFAULT_SHEET_READ_MAX_CELLS = 20_000;
+const DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS = 60_000;
+const MAX_SHEET_READ_ROWS = 5_000;
+const MAX_SHEET_READ_CELLS = 100_000;
+const MAX_SHEET_READ_OUTPUT_CHARS = 80_000;
+
+const MAX_SHEET_WRITE_ROWS = 5_000;
+const MAX_SHEET_WRITE_CELLS = 50_000;
+const MAX_SHEET_WRITE_BYTES = 1_500_000;
 
 // ---------------------------------------------------------------------------
 // Zod Schemas
@@ -24,7 +43,13 @@ const UpdateGoogleSheetSchema = z.object({
 
 const GetGoogleSheetContentSchema = z.object({
   spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
-  range: z.string().min(1, "Range is required")
+  range: z.string().min(1, "Range is required"),
+  maxRows: z.number().int().min(1).max(MAX_SHEET_READ_ROWS).optional()
+    .default(DEFAULT_SHEET_READ_MAX_ROWS),
+  maxCells: z.number().int().min(1).max(MAX_SHEET_READ_CELLS).optional()
+    .default(DEFAULT_SHEET_READ_MAX_CELLS),
+  maxOutputChars: z.number().int().min(1_000).max(MAX_SHEET_READ_OUTPUT_CHARS).optional()
+    .default(DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS),
 });
 
 const FormatGoogleSheetCellsSchema = z.object({
@@ -216,6 +241,141 @@ const HideShowDimensionSchema = z.object({
   endIndex: z.number().int().min(0)
 }).refine(a => a.startIndex < a.endIndex, { message: "startIndex must be less than endIndex" });
 
+interface BoundedSheetRange {
+  range: string;
+  sheetPrefix: string;
+  startColumn: string;
+  endColumn: string;
+  startRow: number;
+  endRow: number;
+  requestedEndRow?: number;
+  openEnded: boolean;
+}
+
+function boundSheetReadRange(range: string, maxRows: number, maxCells: number): BoundedSheetRange {
+  const bangIndex = range.lastIndexOf('!');
+  const sheetPrefix = bangIndex >= 0 ? range.slice(0, bangIndex + 1) : '';
+  const cellRange = (bangIndex >= 0 ? range.slice(bangIndex + 1) : range).trim();
+  const match = cellRange.match(/^([A-Za-z]+)(\d*)(?::([A-Za-z]+)?(\d*))?$/);
+
+  if (!match) {
+    throw new Error(
+      `Range "${range}" is not a bounded A1 cell range. Use an explicit column range such as ` +
+      `"Sheet1!A1:Z500"; full-row and named ranges are intentionally rejected to prevent oversized responses.`,
+    );
+  }
+
+  const startColumn = match[1].toUpperCase();
+  const startRow = match[2] ? Number(match[2]) : 1;
+  const hasColon = cellRange.includes(':');
+  const endColumn = (match[3] || startColumn).toUpperCase();
+  const requestedEndRow = match[4] ? Number(match[4]) : undefined;
+  const startColumnIndex = colToIndex(startColumn);
+  const endColumnIndex = colToIndex(endColumn);
+
+  if (startColumnIndex < 0 || endColumnIndex < startColumnIndex) {
+    throw new Error(`Invalid or reversed column range: ${startColumn}:${endColumn}`);
+  }
+  if (!Number.isInteger(startRow) || startRow < 1) {
+    throw new Error(`Invalid starting row in range: ${range}`);
+  }
+
+  const columnCount = endColumnIndex - startColumnIndex + 1;
+  const rowsAllowedByCells = Math.floor(maxCells / columnCount);
+  if (rowsAllowedByCells < 1) {
+    throw new Error(
+      `Range ${startColumn}:${endColumn} spans ${columnCount} columns, exceeding maxCells=${maxCells}. ` +
+      `Request fewer columns or raise maxCells (maximum ${MAX_SHEET_READ_CELLS}).`,
+    );
+  }
+
+  const effectiveMaxRows = Math.min(maxRows, rowsAllowedByCells);
+  const singleCell = !hasColon && Boolean(match[2]);
+  const openEnded = !singleCell && requestedEndRow === undefined;
+  const desiredEndRow = singleCell
+    ? startRow
+    : requestedEndRow ?? (startRow + effectiveMaxRows - 1);
+  const endRow = Math.min(desiredEndRow, startRow + effectiveMaxRows - 1);
+
+  if (desiredEndRow < startRow) {
+    throw new Error(`Invalid or reversed row range: ${startRow}:${desiredEndRow}`);
+  }
+
+  return {
+    range: `${sheetPrefix}${startColumn}${startRow}:${endColumn}${endRow}`,
+    sheetPrefix,
+    startColumn,
+    endColumn,
+    startRow,
+    endRow,
+    requestedEndRow,
+    openEnded,
+  };
+}
+
+function validateSheetWritePayload(values: unknown[][], operation: string): string | undefined {
+  const rows = values.length;
+  const cells = values.reduce((total, row) => total + row.length, 0);
+  const bytes = Buffer.byteLength(JSON.stringify(values), 'utf8');
+
+  if (rows > MAX_SHEET_WRITE_ROWS) {
+    return `${operation} contains ${rows} rows; maximum is ${MAX_SHEET_WRITE_ROWS}. Split the write into chunks.`;
+  }
+  if (cells > MAX_SHEET_WRITE_CELLS) {
+    return `${operation} contains ${cells} cells; maximum is ${MAX_SHEET_WRITE_CELLS}. Split the write into chunks.`;
+  }
+  if (bytes > MAX_SHEET_WRITE_BYTES) {
+    return `${operation} payload is ${bytes} bytes; maximum is ${MAX_SHEET_WRITE_BYTES}. Split the write into chunks.`;
+  }
+  return undefined;
+}
+
+function renderSheetRows(
+  values: unknown[][],
+  bounded: BoundedSheetRange,
+  maxOutputChars: number,
+): {
+  text: string;
+  returnedRows: number;
+  returnedCells: number;
+  outputTruncated: boolean;
+} {
+  const heading = `Content for range ${bounded.range}:\n\n`;
+  const summaryReserve = 500;
+  const bodyLimit = Math.max(1, maxOutputChars - summaryReserve);
+  let text = heading;
+  let returnedRows = 0;
+  let returnedCells = 0;
+  let outputTruncated = false;
+
+  for (const row of values) {
+    const rowNumber = bounded.startRow + returnedRows;
+    const cells = row.map((value) => String(value ?? '').replace(/\r?\n/g, '\\n'));
+    const line = `Row ${rowNumber}: ${cells.join(', ')}\n`;
+    if (text.length + line.length > bodyLimit) {
+      outputTruncated = true;
+      if (returnedRows === 0) {
+        const omission =
+          `Row ${rowNumber}: [omitted because this row exceeds maxOutputChars=${maxOutputChars}; ` +
+          `request fewer columns or raise maxOutputChars]\n`;
+        if (text.length + omission.length <= bodyLimit) text += omission;
+        returnedRows = 1;
+        returnedCells = 0;
+      }
+      break;
+    }
+    text += line;
+    returnedRows += 1;
+    returnedCells += row.length;
+  }
+
+  if (values.length === 0) {
+    text += '(empty range)\n';
+  }
+
+  return { text, returnedRows, returnedCells, outputTruncated };
+}
+
 // ---------------------------------------------------------------------------
 // Tool Definitions
 // ---------------------------------------------------------------------------
@@ -267,12 +427,15 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "getGoogleSheetContent",
-    description: "Get content of a Google Sheet with cell information",
+    description: "Get Google Sheet content using a bounded A1 range. Large reads are limited by rows, cells, and output characters; use nextRange from the response to continue safely.",
     inputSchema: {
       type: "object",
       properties: {
         spreadsheetId: { type: "string", description: "Spreadsheet ID" },
-        range: { type: "string", description: "Range to get (e.g., 'Sheet1!A1:C10')" }
+        range: { type: "string", description: "Explicit A1 column/cell range (e.g., 'Sheet1!A1:C10'). Full-row and named ranges are rejected." },
+        maxRows: { type: "number", description: `Maximum rows per call (default ${DEFAULT_SHEET_READ_MAX_ROWS}, max ${MAX_SHEET_READ_ROWS})` },
+        maxCells: { type: "number", description: `Maximum cells per call (default ${DEFAULT_SHEET_READ_MAX_CELLS}, max ${MAX_SHEET_READ_CELLS})` },
+        maxOutputChars: { type: "number", description: `Maximum response characters (default ${DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS}, max ${MAX_SHEET_READ_OUTPUT_CHARS})` },
       },
       required: ["spreadsheetId", "range"]
     }
@@ -769,6 +932,8 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
+      const payloadError = validateSheetWritePayload(a.data, 'createGoogleSheet');
+      if (payloadError) return errorResponse(payloadError);
 
       const parentFolderId = await ctx.resolveFolderId(a.parentFolderId);
 
@@ -827,6 +992,8 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
+      const payloadError = validateSheetWritePayload(a.data, 'updateGoogleSheet');
+      if (payloadError) return errorResponse(payloadError);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       await sheets.spreadsheets.values.update({
@@ -848,23 +1015,46 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
+      const bounded = boundSheetReadRange(a.range, a.maxRows, a.maxCells);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const response = await sheets.spreadsheets.values.get({
-        spreadsheetId: a.spreadsheetId,
-        range: a.range
-      });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.values.get(
+          {
+            spreadsheetId: a.spreadsheetId,
+            range: bounded.range,
+          },
+          { signal },
+        ),
+        ctx.runtimeConfig,
+        'sheets.values.get',
+        ctx.log,
+      );
 
-      const values = response.data.values || [];
-      let content = `Content for range ${a.range}:\n\n`;
-
-      if (values.length === 0) {
-        content += "(empty range)";
-      } else {
-        values.forEach((row, rowIndex) => {
-          content += `Row ${rowIndex + 1}: ${row.join(', ')}\n`;
-        });
-      }
+      const values = (response.data.values || []) as unknown[][];
+      const rendered = renderSheetRows(values, bounded, a.maxOutputChars);
+      const boundedByRows = bounded.openEnded
+        || (bounded.requestedEndRow !== undefined && bounded.endRow < bounded.requestedEndRow);
+      const hasPotentialNextPage = rendered.outputTruncated
+        || (boundedByRows && values.length >= (bounded.endRow - bounded.startRow + 1));
+      const nextStartRow = bounded.startRow + rendered.returnedRows;
+      const requestedLastRow = bounded.requestedEndRow;
+      const nextEndRow = requestedLastRow === undefined
+        ? nextStartRow + (bounded.endRow - bounded.startRow)
+        : Math.min(
+          requestedLastRow,
+          nextStartRow + (bounded.endRow - bounded.startRow),
+        );
+      const nextRange = hasPotentialNextPage
+        && (requestedLastRow === undefined || nextStartRow <= requestedLastRow)
+          ? `${bounded.sheetPrefix}${bounded.startColumn}${nextStartRow}:${bounded.endColumn}${nextEndRow}`
+          : undefined;
+      const truncated = hasPotentialNextPage || rendered.outputTruncated;
+      let content = rendered.text;
+      content += `\n[Read summary: returnedRows=${rendered.returnedRows}, returnedCells=${rendered.returnedCells}, ` +
+        `fetchedRange=${bounded.range}, truncated=${truncated ? 'yes' : 'no'}`;
+      if (nextRange) content += `, nextRange=${nextRange}`;
+      content += ']';
 
       return {
         content: [{ type: "text", text: content }],
@@ -1308,6 +1498,8 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
+      const payloadError = validateSheetWritePayload(a.values, 'appendSpreadsheetRows');
+      if (payloadError) return errorResponse(payloadError);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       const response = await sheets.spreadsheets.values.append({

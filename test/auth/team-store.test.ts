@@ -515,7 +515,9 @@ test('FileTeamStore: durable sections survive a restart; pending/codes do not', 
   }
 });
 
-test('FileTeamStore: store file is created with mode 0600', async () => {
+test('FileTeamStore: store file is created with mode 0600', {
+  skip: process.platform === 'win32' ? 'Windows does not expose POSIX chmod bits reliably' : false,
+}, async () => {
   const { dir, filePath } = await makeFileStore();
   try {
     const stat = await fs.stat(filePath);

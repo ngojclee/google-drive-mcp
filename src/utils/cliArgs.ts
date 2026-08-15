@@ -4,6 +4,9 @@ export interface RuntimeConfig {
   retryMax: number;
   retryBaseDelay: number;
   disableResources: boolean;
+  maxConcurrentTools: number;
+  maxQueuedTools: number;
+  toolQueueTimeout: number;
 }
 
 const DEFAULTS: RuntimeConfig = {
@@ -11,6 +14,9 @@ const DEFAULTS: RuntimeConfig = {
   retryMax: 3,
   retryBaseDelay: 1_000,
   disableResources: false,
+  maxConcurrentTools: 8,
+  maxQueuedTools: 64,
+  toolQueueTimeout: 15_000,
 };
 
 function parseIntOr(value: string | undefined, fallback: number): number {
@@ -43,6 +49,18 @@ export function loadRuntimeConfig(argv: string[] = process.argv.slice(2)): Runti
   cfg.retryMax = parseIntOr(process.env.GOOGLE_DRIVE_MCP_RETRY_MAX, cfg.retryMax);
   cfg.retryBaseDelay = parseIntOr(process.env.GOOGLE_DRIVE_MCP_RETRY_BASE_DELAY, cfg.retryBaseDelay);
   cfg.disableResources = parseBoolEnv(process.env.GOOGLE_DRIVE_MCP_DISABLE_RESOURCES, cfg.disableResources);
+  cfg.maxConcurrentTools = parseIntOr(
+    process.env.GOOGLE_DRIVE_MCP_MAX_CONCURRENT_TOOLS,
+    cfg.maxConcurrentTools,
+  );
+  cfg.maxQueuedTools = parseIntOr(
+    process.env.GOOGLE_DRIVE_MCP_MAX_QUEUED_TOOLS,
+    cfg.maxQueuedTools,
+  );
+  cfg.toolQueueTimeout = parseIntOr(
+    process.env.GOOGLE_DRIVE_MCP_TOOL_QUEUE_TIMEOUT,
+    cfg.toolQueueTimeout,
+  );
 
   // CLI args override (numeric flags: --key=value; boolean flags: presence)
   for (const arg of argv) {
@@ -52,6 +70,12 @@ export function loadRuntimeConfig(argv: string[] = process.argv.slice(2)): Runti
       cfg.retryMax = parseIntOr(arg.split('=')[1], cfg.retryMax);
     } else if (arg.startsWith('--retry-base-delay=')) {
       cfg.retryBaseDelay = parseIntOr(arg.split('=')[1], cfg.retryBaseDelay);
+    } else if (arg.startsWith('--max-concurrent-tools=')) {
+      cfg.maxConcurrentTools = parseIntOr(arg.split('=')[1], cfg.maxConcurrentTools);
+    } else if (arg.startsWith('--max-queued-tools=')) {
+      cfg.maxQueuedTools = parseIntOr(arg.split('=')[1], cfg.maxQueuedTools);
+    } else if (arg.startsWith('--tool-queue-timeout=')) {
+      cfg.toolQueueTimeout = parseIntOr(arg.split('=')[1], cfg.toolQueueTimeout);
     } else if (arg === '--no-resources') {
       cfg.disableResources = true;
     } else if (arg.startsWith('--no-resources=')) {

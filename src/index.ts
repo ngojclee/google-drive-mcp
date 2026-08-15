@@ -43,6 +43,7 @@ import {
 import type { AccountOps, AddAccountResult, ToolContext, ToolResult } from './types.js';
 import { errorResponse } from './types.js';
 import { loadRuntimeConfig, parseBoolEnv, type RuntimeConfig } from './utils/cliArgs.js';
+import { ToolConcurrencyLimiter } from './utils/concurrency.js';
 import { GOOGLE_CALLBACK_PATH, isLoopbackHost, loadTeamConfig } from './auth/team/config.js';
 import { createTeamRuntime, type TeamRuntime } from './auth/team/runtime.js';
 import { coversScopes } from './auth/accountResolver.js';
@@ -90,6 +91,11 @@ function log(message: string, data?: any) {
 
 const runtimeConfig = loadRuntimeConfig();
 log('Runtime config:', runtimeConfig);
+const toolLimiter = new ToolConcurrencyLimiter(
+  runtimeConfig.maxConcurrentTools,
+  runtimeConfig.maxQueuedTools,
+  runtimeConfig.toolQueueTimeout,
+);
 
 // -----------------------------------------------------------------------------
 // AUTH / ACCOUNT ACCESS
@@ -752,10 +758,6 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
   });
 
   s.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (teamRuntime) {
-      return handleTeamToolCall(request.params.name, request.params.arguments ?? {}, extra);
-    }
-    await ensureAuthSystem();
     const toolName = request.params.name;
     const rawArgs = request.params.arguments ?? {};
     // Resolve per-session state against the transport's real session id — the
@@ -767,43 +769,59 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
     log('Handling tool request', { tool: toolName });
 
     try {
-      let ctx: ToolContext;
-      let toolArgs: Record<string, unknown>;
-
-      if (ADMIN_TOOLS.has(toolName)) {
-        // Admin tools operate on system-wide state; they run with the default
-        // account's context for back-compat but ignore any `account` arg. Tolerate
-        // a missing/unusable default so manage_accounts still works with zero
-        // accounts or a revoked default (its handlers only touch accountOps).
-        ctx = await buildToolContext(sessionId, undefined, { tolerateClientFailure: true });
-        toolArgs = rawArgs;
-      } else {
-        const meta = TOOL_META[toolName] ?? FALLBACK_META;
-        const accountArg = normalizeAccountArg(rawArgs.account);
-        const sys = requireAuthSystem();
-        const targeting = await sys.resolver.resolve(accountArg, meta.opKind, {
-          sessionId,
-          acceptableScopes: meta.acceptableScopes,
-        });
-        if (targeting.kind === 'fanout') {
-          // Phase 2 ships single-account dispatch only. Read-fanout is Phase 3.
-          throw new Error(
-            `Tool "${toolName}" resolved to multiple accounts (${targeting.accounts
-              .map((a) => a.alias)
-              .join(', ')}). Read-fanout is not yet supported. Specify 'account' explicitly ` +
-              `or run manage_accounts set_default to pick one.`,
-          );
+      return await toolLimiter.run(async (waitMs) => {
+        if (waitMs > 0) {
+          log('Tool request left concurrency queue', {
+            tool: toolName,
+            waitMs,
+            inFlight: toolLimiter.inFlight,
+            queued: toolLimiter.queued,
+          });
         }
-        const account = targeting.accounts[0];
-        ctx = await buildToolContext(sessionId, account);
-        toolArgs = stripAccountArg(rawArgs);
-      }
 
-      for (const mod of domainModules) {
-        const result = await mod.handleTool(toolName, toolArgs, ctx);
-        if (result !== null) return result;
-      }
-      return errorResponse('Tool not found');
+        if (teamRuntime) {
+          return handleTeamToolCall(toolName, rawArgs, extra);
+        }
+
+        await ensureAuthSystem();
+        let ctx: ToolContext;
+        let toolArgs: Record<string, unknown>;
+
+        if (ADMIN_TOOLS.has(toolName)) {
+          // Admin tools operate on system-wide state; they run with the default
+          // account's context for back-compat but ignore any `account` arg. Tolerate
+          // a missing/unusable default so manage_accounts still works with zero
+          // accounts or a revoked default (its handlers only touch accountOps).
+          ctx = await buildToolContext(sessionId, undefined, { tolerateClientFailure: true });
+          toolArgs = rawArgs;
+        } else {
+          const meta = TOOL_META[toolName] ?? FALLBACK_META;
+          const accountArg = normalizeAccountArg(rawArgs.account);
+          const sys = requireAuthSystem();
+          const targeting = await sys.resolver.resolve(accountArg, meta.opKind, {
+            sessionId,
+            acceptableScopes: meta.acceptableScopes,
+          });
+          if (targeting.kind === 'fanout') {
+            // Phase 2 ships single-account dispatch only. Read-fanout is Phase 3.
+            throw new Error(
+              `Tool "${toolName}" resolved to multiple accounts (${targeting.accounts
+                .map((a) => a.alias)
+                .join(', ')}). Read-fanout is not yet supported. Specify 'account' explicitly ` +
+                `or run manage_accounts set_default to pick one.`,
+            );
+          }
+          const account = targeting.accounts[0];
+          ctx = await buildToolContext(sessionId, account);
+          toolArgs = stripAccountArg(rawArgs);
+        }
+
+        for (const mod of domainModules) {
+          const result = await mod.handleTool(toolName, toolArgs, ctx);
+          if (result !== null) return result;
+        }
+        return errorResponse('Tool not found');
+      });
     } catch (error) {
       log('Error in tool request handler', { error: (error as Error).message });
       return errorResponse((error as Error).message);
@@ -964,6 +982,9 @@ Options:
   --api-timeout=<ms>         Per-request API timeout in ms; 0 disables (default: 120000)
   --retry-max=<n>            Max retry attempts on transient failures; 0 disables (default: 3)
   --retry-base-delay=<ms>    Base delay for retry backoff in ms (default: 1000)
+  --max-concurrent-tools=<n> Maximum tool calls running at once; 0 disables the limit (default: 8)
+  --max-queued-tools=<n>     Maximum tool calls waiting for a worker slot (default: 64)
+  --tool-queue-timeout=<ms>  Maximum queue wait before returning a busy error (default: 15000)
 
 Examples:
   npx @piotr-agier/google-drive-mcp auth
@@ -980,6 +1001,9 @@ Environment Variables:
   Common Configuration:
   GOOGLE_DRIVE_MCP_SCOPES               Comma-separated scopes to request (aliases or full URLs; defaults to all Drive/Docs/Sheets/Slides/Calendar scopes). Applies to local OAuth, external OAuth, and service account modes.
   GOOGLE_DRIVE_MCP_DISABLE_RESOURCES    Disable the MCP resource protocol (gdrive:/// listing/reading); tools stay available. Accepts 1/0, true/false, yes/no, on/off. Mirrored by the --no-resources[=<bool>] flag. (default: enabled)
+  GOOGLE_DRIVE_MCP_MAX_CONCURRENT_TOOLS Maximum tool calls running at once (default: 8)
+  GOOGLE_DRIVE_MCP_MAX_QUEUED_TOOLS     Maximum queued tool calls (default: 64)
+  GOOGLE_DRIVE_MCP_TOOL_QUEUE_TIMEOUT   Queue wait timeout in milliseconds (default: 15000)
 
   Transport Configuration:
   MCP_TRANSPORT                         Transport mode: stdio or http (default: stdio)
@@ -1401,6 +1425,9 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         // Request/response MCP methods do not need SSE; GET /mcp remains
         // available for server-initiated notifications.
         enableJsonResponse: true,
+        // SDK 1.30+ emits SSE comment frames so idle standalone streams remain
+        // established through clients, reverse proxies, and connection pools.
+        keepAliveMs: 15_000,
       });
       // Per-session isolation needs no wiring here: the SDK injects the
       // transport's sessionId into each request's `extra`, which the shared
@@ -1462,15 +1489,7 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         return;
       }
       resetSessionTimer(sessionId!);
-      // This server does not emit unsolicited MCP notifications. Advertising a
-      // long-lived GET stream makes Codex Desktop wait for an SSE message
-      // before dispatching tools, so explicitly decline the optional stream.
-      res.set('Allow', 'POST, DELETE');
-      res.status(405).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Method Not Allowed: SSE stream is not available' },
-        id: null,
-      });
+      await session.transport.handleRequest(req, res);
     } catch (error) {
       log('Error handling GET /mcp', { error: (error as Error).message });
       if (!res.headersSent) {

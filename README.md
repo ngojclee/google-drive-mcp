@@ -329,9 +329,9 @@ Authentication tokens are stored securely following the XDG Base Directory speci
 Configure timeouts and retry behavior via CLI flags (preferred) or environment variables.
 CLI flags take priority over env vars.
 
-> **Scope:** these settings currently apply to the `createGoogleDoc` content-insertion
-> call (the `documents.batchUpdate` that was prone to silent timeouts). They are not
-> yet wired into every Google API call.
+> **Scope:** timeout/retry settings apply to retry-wrapped Google API calls. The
+> concurrency limiter applies to every MCP tool call in the process, across all
+> HTTP sessions.
 
 ### CLI flags
 
@@ -340,12 +340,31 @@ CLI flags take priority over env vars.
 | `--api-timeout=<ms>`      | 120000  | Per-attempt timeout for the retry-wrapped call; `0` disables the timeout     |
 | `--retry-max=<N>`         | 3       | Max retry attempts on retryable errors (429/503/504, timeouts, network); `0` disables retries |
 | `--retry-base-delay=<ms>` | 1000    | Base delay for exponential backoff (capped at 30s, with jitter)             |
+| `--max-concurrent-tools=<N>` | 8    | Maximum tool calls running at once across the process; `0` disables the limit |
+| `--max-queued-tools=<N>`  | 64      | Maximum calls waiting for a worker slot; `0` rejects instead of queueing    |
+| `--tool-queue-timeout=<ms>` | 15000 | Maximum queue wait before returning a clear busy error; `0` waits indefinitely |
 
 ### Environment variables (fallback)
 
 - `GOOGLE_DRIVE_MCP_API_TIMEOUT`
 - `GOOGLE_DRIVE_MCP_RETRY_MAX`
 - `GOOGLE_DRIVE_MCP_RETRY_BASE_DELAY`
+- `GOOGLE_DRIVE_MCP_MAX_CONCURRENT_TOOLS`
+- `GOOGLE_DRIVE_MCP_MAX_QUEUED_TOOLS`
+- `GOOGLE_DRIVE_MCP_TOOL_QUEUE_TIMEOUT`
+
+Recommended shared-server defaults:
+
+```env
+GOOGLE_DRIVE_MCP_MAX_CONCURRENT_TOOLS=8
+GOOGLE_DRIVE_MCP_MAX_QUEUED_TOOLS=64
+GOOGLE_DRIVE_MCP_TOOL_QUEUE_TIMEOUT=15000
+```
+
+These values prevent request bursts from exhausting memory or creating
+unbounded waits. They do not bypass Google Workspace quotas. Clients should
+retry a returned busy or quota error with exponential backoff rather than
+immediately submitting the same burst again.
 
 ### Example (Claude Desktop config)
 
@@ -423,7 +442,7 @@ CLI flags take priority over environment variables.
 | `--port` | `MCP_HTTP_PORT` | `3100` | HTTP listen port |
 | `--host` | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP bind address |
 
-The HTTP endpoint is `POST /mcp` for JSON-RPC requests, `GET /mcp` for SSE streaming, and `DELETE /mcp` to close a session. After the initial `initialize` request, all subsequent requests must include the `mcp-session-id` header returned in the initialize response.
+The HTTP endpoint is `POST /mcp` for JSON-RPC requests, `GET /mcp` for SSE streaming, and `DELETE /mcp` to close a session. After the initial `initialize` request, all subsequent requests must include the `mcp-session-id` header returned in the initialize response. Request/response methods such as `tools/call` return `application/json`; the optional GET stream sends SSE keep-alive comments so proxies and clients do not mistake an idle stream for a stalled tool call.
 
 When binding to `127.0.0.1` (default), DNS rebinding protection is automatically enabled. For remote deployments (`0.0.0.0`), prefer [Team Mode](#team-mode-multi-user-http-deployments), which authenticates every request with per-user OAuth; a single-identity remote deployment (service account or external token) must sit behind a reverse proxy with TLS and its own access control. **Without authentication and TLS, anyone who can reach the port gets full access to the configured Google Drive account.**
 
@@ -816,9 +835,20 @@ Team mode is mutually exclusive with service-account and external-token modes, n
   - `data`: 2D array of new values
   - `valueInputOption`: `RAW` (default, safe) or `USER_ENTERED` (evaluates formulas) (optional)
 
-- **getGoogleSheetContent** - Get spreadsheet content with cell information
+- **getGoogleSheetContent** - Get bounded spreadsheet content with continuation metadata
   - `spreadsheetId`: Spreadsheet ID
-  - `range`: Range to get (e.g., 'Sheet1!A1:C10')
+  - `range`: Explicit A1 column/cell range (e.g., `Sheet1!A1:C10` or `Sheet1!A:C`)
+  - `maxRows`: Maximum rows per call (optional, default: 500, max: 5,000)
+  - `maxCells`: Maximum cells per call (optional, default: 20,000, max: 100,000)
+  - `maxOutputChars`: Maximum response characters (optional, default: 60,000, max: 80,000)
+  - Full-row ranges such as `Sheet1!1:100` and named ranges are rejected; specify columns explicitly
+  - When the response says `truncated=yes`, call the tool again using the returned `nextRange`
+
+Sheets writes are rejected before contacting Google when one call exceeds
+5,000 rows, 50,000 cells, or 1,500,000 serialized bytes. Split larger writes
+into ordered chunks. These safeguards keep MCP responses below practical
+client limits and reduce timeout ambiguity; they are intentionally below
+Google's approximate 2 MB request recommendation.
 
 #### Sheet Management
 - **getSpreadsheetInfo** - Get detailed information about a spreadsheet including all sheets/tabs
@@ -1422,11 +1452,17 @@ Error: Google Sheets API has not been used in project...
 #### Rate Limiting (429 errors)
 **Google API Quotas:**
 - Drive API: 12,000 requests per minute
-- Docs/Sheets/Slides: 300 requests per minute
+- Sheets: 300 read and 300 write requests per minute per project, plus 60
+  read and 60 write requests per minute per user per project
+- Google recommends keeping Sheets request payloads around 2 MB or less, and a
+  request that runs longer than 180 seconds can time out
 
 **Solution:**
-- Implement exponential backoff
+- Keep the bounded concurrency and queue defaults enabled
+- Retry quota errors with exponential backoff
 - Batch operations where possible
+- Read explicit ranges and follow `nextRange` instead of requesting whole sheets
+- Split writes that exceed the server's row, cell, or byte limits
 - Check quota usage in Google Cloud Console
 
 ### Docker-Specific Issues

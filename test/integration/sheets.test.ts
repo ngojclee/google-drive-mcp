@@ -57,6 +57,17 @@ describe('Sheets tools', () => {
       const res = await callTool(ctx.client, 'updateGoogleSheet', {});
       assert.equal(res.isError, true);
     });
+
+    it('rejects oversized writes before calling Google', async () => {
+      const res = await callTool(ctx.client, 'updateGoogleSheet', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A1',
+        data: Array.from({ length: 5_001 }, () => ['x']),
+      });
+      assert.equal(res.isError, true);
+      assert.ok(res.content[0].text!.includes('Split the write into chunks'));
+      assert.equal(ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.update').length, 0);
+    });
   });
 
   // --- getGoogleSheetContent ---
@@ -70,11 +81,93 @@ describe('Sheets tools', () => {
       });
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('Alice'));
+      assert.ok(res.content[0].text!.includes('returnedRows=2'));
+      assert.ok(res.content[0].text!.includes('truncated=no'));
     });
 
     it('validation error', async () => {
       const res = await callTool(ctx.client, 'getGoogleSheetContent', {});
       assert.equal(res.isError, true);
+    });
+
+    it('bounds an open-ended range and returns nextRange', async () => {
+      const rows = Array.from({ length: 3 }, (_, index) => [`row-${index + 1}`]);
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: rows },
+      }));
+
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A:A',
+        maxRows: 3,
+      });
+
+      assert.equal(res.isError, false);
+      const calls = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get');
+      const call = calls[calls.length - 1];
+      assert.equal(call?.args[0].range, 'Sheet1!A1:A3');
+      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A4:A6'));
+    });
+
+    it('clamps rows to the maxCells budget', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: [['a', 'b'], ['c', 'd']] },
+      }));
+
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A1:B100',
+        maxRows: 100,
+        maxCells: 4,
+      });
+
+      assert.equal(res.isError, false);
+      const calls = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get');
+      const call = calls[calls.length - 1];
+      assert.equal(call?.args[0].range, 'Sheet1!A1:B2');
+      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A3:B4'));
+    });
+
+    it('rejects full-row ranges that cannot be safely bounded by columns', async () => {
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!1:100',
+      });
+      assert.equal(res.isError, true);
+      assert.ok(res.content[0].text!.includes('explicit column range'));
+    });
+
+    it('stops before the output character limit and returns a continuation range', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: Array.from({ length: 20 }, () => ['x'.repeat(200)]) },
+      }));
+
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A1:A20',
+        maxOutputChars: 1_000,
+      });
+
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.length <= 1_000);
+      assert.ok(res.content[0].text!.includes('truncated=yes'));
+      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A3:A20'));
+    });
+
+    it('advances past a single row that exceeds the output budget', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: [['x'.repeat(2_000)], ['next']] },
+      }));
+
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A1:A2',
+        maxOutputChars: 1_000,
+      });
+
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('Row 1: [omitted'));
+      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A2:A2'));
     });
   });
 

@@ -6,10 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Decline the optional standalone GET SSE stream with `405 Method Not Allowed`
-  because the server does not emit unsolicited notifications. This prevents
-  Codex Desktop from waiting 300 seconds for the first SSE event before a tool
-  call can complete.
+- Upgrade the MCP TypeScript SDK to `1.30.0`, keep POST request/response calls
+  on JSON, and use the SDK's SSE heartbeat support for optional GET streams.
+- Upgrade Google API dependencies and remove the unused
+  `@google-cloud/local-auth` dependency.
+- Bound concurrent tool execution with a configurable worker pool and queue so
+  bursts fail clearly instead of exhausting Google quotas or timing out.
+- Bound Google Sheets reads by rows, cells, and output characters, return a
+  continuation `nextRange`, and reject oversized writes with chunking guidance.
 - Include the JSON-RPC method and request ID in MCP HTTP lifecycle logs without
   logging tool arguments or Google data.
 

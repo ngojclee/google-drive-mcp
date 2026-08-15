@@ -110,4 +110,18 @@ test('unrelated runtime config defaults are preserved', withVar(undefined, () =>
   assert.equal(cfg.apiTimeout, 120_000);
   assert.equal(cfg.retryMax, 3);
   assert.equal(cfg.retryBaseDelay, 1_000);
+  assert.equal(cfg.maxConcurrentTools, 8);
+  assert.equal(cfg.maxQueuedTools, 64);
+  assert.equal(cfg.toolQueueTimeout, 15_000);
 }));
+
+test('tool concurrency settings accept CLI overrides', () => {
+  const cfg = loadRuntimeConfig([
+    '--max-concurrent-tools=12',
+    '--max-queued-tools=80',
+    '--tool-queue-timeout=25000',
+  ]);
+  assert.equal(cfg.maxConcurrentTools, 12);
+  assert.equal(cfg.maxQueuedTools, 80);
+  assert.equal(cfg.toolQueueTimeout, 25_000);
+});
