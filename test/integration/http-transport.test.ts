@@ -122,6 +122,11 @@ describe('HTTP transport', () => {
     });
 
     assert.equal(res.status, 200);
+    assert.match(
+      res.headers.get('content-type') || '',
+      /^application\/json\b/,
+      'initialize should complete as a JSON response rather than a long-lived SSE stream',
+    );
     const sessionId = res.headers.get('mcp-session-id');
     assert.ok(sessionId, 'response should include mcp-session-id header');
 
@@ -173,10 +178,48 @@ describe('HTTP transport', () => {
     });
 
     assert.equal(toolsRes.status, 200);
+    assert.match(
+      toolsRes.headers.get('content-type') || '',
+      /^application\/json\b/,
+      'tools/list should complete as a JSON response',
+    );
     const body = await parseResponse(toolsRes);
     assert.equal(body.id, 2);
     assert.ok(Array.isArray(body.result?.tools), 'should return tools array');
     assert.ok(body.result.tools.length > 0, 'should have at least one tool');
+  });
+
+  it('completes tools/call as application/json', async () => {
+    const sessionId = await initializeSession(baseUrl);
+    await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+      }),
+    });
+
+    const callRes = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'getGoogleSheetContent',
+          arguments: { spreadsheetId: 'sheet-1', range: 'Sheet1!A1:B2' },
+        },
+        id: 3,
+      }),
+      signal: AbortSignal.timeout(2_000),
+    });
+
+    assert.equal(callRes.status, 200);
+    assert.match(callRes.headers.get('content-type') || '', /^application\/json\b/);
+    const body = await parseResponse(callRes);
+    assert.equal(body.id, 3);
+    assert.notEqual(body.result?.isError, true);
   });
 
   it('returns 400 for non-initialize request without session', async () => {

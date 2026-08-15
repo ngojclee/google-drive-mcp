@@ -1296,6 +1296,36 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
   const sessions = new Map<string, HttpSession>();
   const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  app.use('/mcp', (req, res, next) => {
+    const startedAt = Date.now();
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    let finished = false;
+
+    res.once('finish', () => {
+      finished = true;
+      log('MCP HTTP response completed', {
+        method: req.method,
+        status: res.statusCode,
+        contentType: res.getHeader('content-type'),
+        sessionId,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    res.once('close', () => {
+      if (!finished) {
+        log('MCP HTTP response aborted', {
+          method: req.method,
+          status: res.statusCode,
+          sessionId,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    });
+
+    next();
+  });
+
   /** Team mode: a session may only be touched by the user who initialized it.
    * A mismatch is answered exactly like an unknown session so other users
    * cannot even probe that the session id exists. */
@@ -1355,6 +1385,11 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       // Create a new session
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
+        // Codex Desktop treats a POST response advertised as SSE as a
+        // long-lived stream even after the JSON-RPC result event arrives.
+        // Request/response MCP methods do not need SSE; GET /mcp remains
+        // available for server-initiated notifications.
+        enableJsonResponse: true,
       });
       // Per-session isolation needs no wiring here: the SDK injects the
       // transport's sessionId into each request's `extra`, which the shared
