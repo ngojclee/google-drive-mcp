@@ -1299,12 +1299,21 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
   app.use('/mcp', (req, res, next) => {
     const startedAt = Date.now();
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const rpcBody = req.method === 'POST' ? req.body : undefined;
+    const rpcMethod = Array.isArray(rpcBody)
+      ? rpcBody.map((message) => message?.method).filter(Boolean).join(',')
+      : rpcBody?.method;
+    const rpcId = Array.isArray(rpcBody)
+      ? rpcBody.map((message) => message?.id).filter((id) => id !== undefined).join(',')
+      : rpcBody?.id;
     let finished = false;
 
     res.once('finish', () => {
       finished = true;
       log('MCP HTTP response completed', {
         method: req.method,
+        rpcMethod,
+        rpcId,
         status: res.statusCode,
         contentType: res.getHeader('content-type'),
         sessionId,
@@ -1316,6 +1325,8 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       if (!finished) {
         log('MCP HTTP response aborted', {
           method: req.method,
+          rpcMethod,
+          rpcId,
           status: res.statusCode,
           sessionId,
           durationMs: Date.now() - startedAt,
@@ -1451,7 +1462,15 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         return;
       }
       resetSessionTimer(sessionId!);
-      await session.transport.handleRequest(req, res);
+      // This server does not emit unsolicited MCP notifications. Advertising a
+      // long-lived GET stream makes Codex Desktop wait for an SSE message
+      // before dispatching tools, so explicitly decline the optional stream.
+      res.set('Allow', 'POST, DELETE');
+      res.status(405).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method Not Allowed: SSE stream is not available' },
+        id: null,
+      });
     } catch (error) {
       log('Error handling GET /mcp', { error: (error as Error).message });
       if (!res.headersSent) {

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Decline the optional standalone GET SSE stream with `405 Method Not Allowed`
+  because the server does not emit unsolicited notifications. This prevents
+  Codex Desktop from waiting 300 seconds for the first SSE event before a tool
+  call can complete.
+- Include the JSON-RPC method and request ID in MCP HTTP lifecycle logs without
+  logging tool arguments or Google data.
+
 ### Bug Fixes
 
 - **http:** return JSON-RPC request responses as `application/json` instead of

@@ -244,6 +244,22 @@ describe('HTTP transport', () => {
     assert.equal(res.status, 400);
   });
 
+  it('declines the optional standalone SSE stream without hanging', async () => {
+    const sessionId = await initializeSession(baseUrl);
+    const res = await fetch(`${baseUrl}/mcp`, {
+      headers: {
+        Accept: 'text/event-stream',
+        'mcp-session-id': sessionId,
+      },
+      signal: AbortSignal.timeout(2_000),
+    });
+
+    assert.equal(res.status, 405);
+    assert.equal(res.headers.get('allow'), 'POST, DELETE');
+    const body = await parseResponse(res);
+    assert.match(body.error?.message || '', /SSE stream is not available/);
+  });
+
   it('DELETE closes session', async () => {
     // Initialize a session
     const initRes = await fetch(`${baseUrl}/mcp`, {
