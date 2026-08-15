@@ -297,8 +297,8 @@ describe('HTTP transport', () => {
         id: 2,
       }),
     });
-    // Session is gone, and it's not an initialize request, so 400
-    assert.equal(postRes.status, 400);
+    // Session is gone, so Streamable HTTP requires 404 to trigger re-initialize.
+    assert.equal(postRes.status, 404);
   });
 });
 
@@ -433,7 +433,7 @@ describe('HTTP transport — session isolation', () => {
       headers: { ...MCP_HEADERS, 'mcp-session-id': sidA },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', params: {}, id: 4 }),
     });
-    assert.equal(aRes.status, 400);
+    assert.equal(aRes.status, 404);
   });
 });
 
@@ -471,7 +471,7 @@ describe('HTTP transport — session idle timeout', () => {
       headers: { ...MCP_HEADERS, 'mcp-session-id': sid },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', params: {}, id: 2 }),
     });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 404);
     assert.equal(sessions.has(sid), false);
   });
 
@@ -588,20 +588,20 @@ describe('HTTP transport — error handling', () => {
     assert.ok(body.error);
   });
 
-  it('DELETE with non-existent session ID returns 400', async () => {
+  it('DELETE with non-existent session ID returns 404', async () => {
     const res = await fetch(`${baseUrl}/mcp`, {
       method: 'DELETE',
       headers: { 'mcp-session-id': 'non-existent-uuid' },
     });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 404);
   });
 
-  it('GET with non-existent session ID returns 400', async () => {
+  it('GET with non-existent session ID returns 404', async () => {
     const res = await fetch(`${baseUrl}/mcp`, {
       method: 'GET',
       headers: { 'mcp-session-id': 'non-existent-uuid' },
     });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 404);
   });
 });
 

@@ -14,6 +14,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from 'crypto';
+import type { Response } from 'express';
 import { google } from "googleapis";
 import type { drive_v3, calendar_v3 } from "googleapis";
 import {
@@ -1393,6 +1394,28 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
     }
   }
 
+  function rejectMissingOrUnknownSession(
+    res: Response,
+    sessionId: string | undefined,
+  ): void {
+    if (sessionId) {
+      // Streamable HTTP requires 404 for a session that no longer exists so
+      // clients discard the stale ID and initialize a replacement session.
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found' },
+        id: null,
+      });
+      return;
+    }
+
+    res.status(400).json({
+      jsonrpc: '2.0',
+      error: { code: -32600, message: 'Bad Request: missing session ID' },
+      id: null,
+    });
+  }
+
   app.post('/mcp', ...mcpGuards, async (req, res) => {
     try {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -1407,8 +1430,13 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         return;
       }
 
-      // New session: only accept initialize requests
+      // New session: only accept initialize requests. A supplied but unknown
+      // session ID is a terminated session and must return 404, not 400.
       if (!isInitializeRequest(req.body)) {
+        if (sessionId) {
+          rejectMissingOrUnknownSession(res, sessionId);
+          return;
+        }
         res.status(400).json({
           jsonrpc: '2.0',
           error: { code: -32600, message: 'Bad Request: expected initialize request or valid session ID' },
@@ -1481,11 +1509,7 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!session || !sessionBelongsToCaller(session, req)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32600, message: 'Bad Request: missing or invalid session ID' },
-          id: null,
-        });
+        rejectMissingOrUnknownSession(res, sessionId);
         return;
       }
       resetSessionTimer(sessionId!);
@@ -1507,11 +1531,7 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!session || !sessionBelongsToCaller(session, req)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32600, message: 'Bad Request: missing or invalid session ID' },
-          id: null,
-        });
+        rejectMissingOrUnknownSession(res, sessionId);
         return;
       }
       await session.transport.close();

@@ -311,22 +311,22 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
 
     // POST with a non-initialize body: indistinguishable from an unknown session.
     const post = await mcpPost(bob, aliceSid, { jsonrpc: '2.0', method: 'tools/list', id: 2 });
-    assert.equal(post.status, 400);
+    assert.equal(post.status, 404);
     const postBody = await post.json();
-    assert.match(postBody.error.message, /expected initialize request or valid session ID/);
+    assert.match(postBody.error.message, /Session not found/);
 
-    // GET (SSE stream) and DELETE: same 400 as an unknown session.
+    // GET (SSE stream) and DELETE: same 404 as an unknown session.
     const get = await fetch(`${baseUrl}/mcp`, {
       headers: { Accept: 'text/event-stream', Authorization: `Bearer ${bob}`, 'mcp-session-id': aliceSid },
     });
-    assert.equal(get.status, 400);
+    assert.equal(get.status, 404);
     await get.text();
 
     const del = await fetch(`${baseUrl}/mcp`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${bob}`, 'mcp-session-id': aliceSid },
     });
-    assert.equal(del.status, 400);
+    assert.equal(del.status, 404);
     await del.text();
 
     // Alice's session survived the hijack attempts.

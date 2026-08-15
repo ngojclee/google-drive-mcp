@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Upgrade the MCP TypeScript SDK to `1.30.0`, keep POST request/response calls
   on JSON, and use the SDK's SSE heartbeat support for optional GET streams.
+- Return HTTP 404 for expired or unknown session IDs so Streamable HTTP clients
+  discard stale sessions and initialize again after a server restart.
 - Upgrade Google API dependencies and remove the unused
   `@google-cloud/local-auth` dependency.
 - Bound concurrent tool execution with a configurable worker pool and queue so

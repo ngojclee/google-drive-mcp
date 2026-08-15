@@ -83,10 +83,13 @@ function makeRecord(overrides: Partial<AccountRecord> = {}): AccountRecord {
 
 /** Wait until `predicate()` returns truthy or `timeoutMs` elapses. Generous
  * default: under full-suite parallel load, 2s was routinely exceeded. */
-async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 10_000,
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error(`waitFor timed out after ${timeoutMs}ms`);
@@ -121,6 +124,10 @@ test('factory persists new access_token from a "tokens" event into AccountStore'
     assert.notEqual(updated.lastRefreshedAt, makeRecord().lastRefreshedAt);
 
     // File on disk reflects the change too.
+    await waitFor(async () => {
+      const persisted = JSON.parse(await fs.readFile(tokenPath, 'utf-8'));
+      return persisted.accounts.work.accessToken === newAccess;
+    });
     const onDisk = JSON.parse(await fs.readFile(tokenPath, 'utf-8'));
     assert.equal(onDisk.accounts.work.accessToken, newAccess);
     assert.equal(onDisk.accounts.work.refreshToken, 'persistent-refresh');
