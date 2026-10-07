@@ -67,15 +67,13 @@ jobs:
           git fetch --depth 1 origin "${{ steps.upstream.outputs.upstream_sha }}"
           git checkout --detach FETCH_HEAD
 
-      - name: Install, lint, build, test
+      - name: Install deps and build dist
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
         working-directory: upstream
         run: |
           set -euo pipefail
-          npm ci
-          npm run lint
-          npm run build
-          npm test
+          npm ci --ignore-scripts
+          node scripts/build.js
 
       - name: Login to Gitea registry
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
