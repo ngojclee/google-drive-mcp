@@ -1,0 +1,105 @@
+name: Build upstream release (Gitea)
+
+# Ported from .github/workflows/build-ghcr-release.yml.
+# Resolves the newest upstream GitHub release via the public API (no auth,
+# ~60 req/hr unauthenticated is enough for a 6h cron), builds that tag,
+# pushes <version>, <major> and latest to the Gitea registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream release tag to build (for example v2.3.0). Leave empty for latest."
+        required: false
+        type: string
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: gitea-upstream-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: gitea.lengoc.me
+  IMAGE: gitea.lengoc.me/automations/google-drive-mcp
+  UPSTREAM: https://github.com/piotr-agier/google-drive-mcp.git
+
+jobs:
+  build:
+    runs-on: docker-build
+    steps:
+      - name: Install docker CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+            | tar xz -C /tmp --strip-components=1 docker/docker
+          mv /tmp/docker /usr/local/bin/docker
+          docker version --format 'client {{.Client.Version}}'
+
+      - name: Resolve upstream release
+        id: upstream
+        run: |
+          set -euo pipefail
+          tag="${{ gitea.event.inputs.upstream_tag }}"
+          if [ -z "$tag" ]; then
+            tag="$(curl -fsSL https://api.github.com/repos/piotr-agier/google-drive-mcp/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+          fi
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "Unexpected upstream tag: $tag" >&2; exit 1 ;;
+          esac
+          git init -q upstream && cd upstream
+          git remote add origin "$UPSTREAM"
+          git fetch --force --depth 1 --tags origin "$tag"
+          commit="$(git rev-parse FETCH_HEAD)"
+          version="${tag#v}"
+          major="${version%%.*}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if version already published
+        id: image
+        run: |
+          if docker manifest inspect "${{ env.IMAGE }}:${{ steps.upstream.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${{ steps.upstream.outputs.version }} already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream tag
+        if: steps.image.outputs.exists != 'true'
+        working-directory: upstream
+        run: git checkout --detach "${{ steps.upstream.outputs.commit }}"
+
+      - name: Install, lint, build, test
+        if: steps.image.outputs.exists != 'true'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run build
+          npm test
+
+      - name: Login to Gitea registry
+        if: steps.image.outputs.exists != 'true'
+        run: echo "${{ secrets.GITEA_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ gitea.actor }}" --password-stdin
+
+      - name: Build and push release image
+        if: steps.image.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/piotr-agier/google-drive-mcp" \
+            --label "org.opencontainers.image.revision=${{ steps.upstream.outputs.commit }}" \
+            --label "org.opencontainers.image.version=${{ steps.upstream.outputs.version }}" \
+            -t "${{ env.IMAGE }}:${{ steps.upstream.outputs.version }}" \
+            -t "${{ env.IMAGE }}:${{ steps.upstream.outputs.major }}" \
+            -t "${{ env.IMAGE }}:latest" \
+            upstream
+          docker push "${{ env.IMAGE }}:${{ steps.upstream.outputs.version }}"
+          docker push "${{ env.IMAGE }}:${{ steps.upstream.outputs.major }}"
+          docker push "${{ env.IMAGE }}:latest"

@@ -1,0 +1,97 @@
+name: Build upstream master edge (Gitea)
+
+# Ported from .github/workflows/sync-upstream-and-build-edge.yml.
+# Differences vs GitHub version:
+#   - plain shell instead of actions/* (works on self-hosted act_runner + dind)
+#   - pushes to gitea.lengoc.me/automations/google-drive-mcp, not GHCR
+#   - DOCKER_HOST is injected by the runner envs (fleet-ci-docker dind)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_edge:
+        description: "Build edge even when upstream master has not changed."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "5 */6 * * *"
+
+concurrency:
+  group: build-upstream-master-edge
+  cancel-in-progress: false
+
+env:
+  REGISTRY: gitea.lengoc.me
+  IMAGE: gitea.lengoc.me/automations/google-drive-mcp
+  UPSTREAM: https://github.com/piotr-agier/google-drive-mcp.git
+
+jobs:
+  build-edge:
+    runs-on: docker-build
+    steps:
+      - name: Install docker CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+            | tar xz -C /tmp --strip-components=1 docker/docker
+          mv /tmp/docker /usr/local/bin/docker
+          docker version --format 'client {{.Client.Version}}'
+
+      - name: Resolve upstream master
+        id: upstream
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote --exit-code "$UPSTREAM" refs/heads/master | awk '{print $1}')"
+          test "${#sha}" -eq 40
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if edge image already published
+        id: image
+        run: |
+          if docker manifest inspect "${{ env.IMAGE }}:edge-${{ steps.upstream.outputs.short_sha }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "edge-${{ steps.upstream.outputs.short_sha }} already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone upstream at resolved sha
+        if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$UPSTREAM" upstream
+          cd upstream
+          git fetch --depth 1 origin "${{ steps.upstream.outputs.upstream_sha }}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Install, lint, build, test
+        if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run build
+          npm test
+
+      - name: Login to Gitea registry
+        if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
+        run: echo "${{ secrets.GITEA_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ gitea.actor }}" --password-stdin
+
+      - name: Build and push edge image
+        if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
+        run: |
+          set -euo pipefail
+          sha="${{ steps.upstream.outputs.upstream_sha }}"
+          short="${{ steps.upstream.outputs.short_sha }}"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/ngojclee/google-drive-mcp" \
+            --label "org.opencontainers.image.revision=${sha}" \
+            --label "org.opencontainers.image.version=edge-${short}" \
+            -t "${{ env.IMAGE }}:edge" \
+            -t "${{ env.IMAGE }}:edge-${short}" \
+            upstream
+          docker push "${{ env.IMAGE }}:edge"
+          docker push "${{ env.IMAGE }}:edge-${short}"
