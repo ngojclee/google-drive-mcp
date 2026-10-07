@@ -93,6 +93,8 @@ export const TOOL_META: Record<string, ToolMeta> = {
   getGoogleDocImage: read(DOCS_READ_SCOPES),
   listGoogleDocs: read(DRIVE_READ_SCOPES),
   getDocumentInfo: read(DOCS_READ_SCOPES),
+  getGoogleDocStyleSummary: read(DOCS_READ_SCOPES),
+  describeGoogleDocRange: read(DOCS_READ_SCOPES),
   readSmartChips: read(DOCS_READ_SCOPES),
 
   createGoogleDoc: write(DOCS_WRITE_SCOPES),
@@ -113,6 +115,7 @@ export const TOOL_META: Record<string, ToolMeta> = {
   deleteComment: write(DRIVE_WRITE_SCOPES),
   insertTable: write(DOCS_WRITE_SCOPES),
   editTableCell: write(DOCS_WRITE_SCOPES),
+  styleDocTable: write(DOCS_WRITE_SCOPES),
   insertImageFromUrl: write(DOCS_WRITE_SCOPES),
   insertLocalImage: write(DOCS_WRITE_SCOPES),
   addDocumentTab: write(DOCS_WRITE_SCOPES),
@@ -122,12 +125,15 @@ export const TOOL_META: Record<string, ToolMeta> = {
 
   // ---- Sheets ----
   getGoogleSheetContent: read(SHEETS_READ_SCOPES),
+  getGoogleSheetCells: read(SHEETS_READ_SCOPES),
   getSpreadsheetInfo: read(SHEETS_READ_SCOPES),
   listSheets: read(SHEETS_READ_SCOPES),
   listGoogleSheets: read(DRIVE_READ_SCOPES),
 
   createGoogleSheet: write(SHEETS_WRITE_SCOPES),
   updateGoogleSheet: write(SHEETS_WRITE_SCOPES),
+  batchUpdateGoogleSheetValues: write(SHEETS_WRITE_SCOPES),
+  updateGoogleSheetIfUnchanged: write(SHEETS_WRITE_SCOPES),
   formatGoogleSheetCells: write(SHEETS_WRITE_SCOPES),
   formatGoogleSheetText: write(SHEETS_WRITE_SCOPES),
   formatGoogleSheetNumbers: write(SHEETS_WRITE_SCOPES),
@@ -148,6 +154,10 @@ export const TOOL_META: Record<string, ToolMeta> = {
   autoResizeRows: write(SHEETS_WRITE_SCOPES),
   hideSheetDimension: write(SHEETS_WRITE_SCOPES),
   showSheetDimension: write(SHEETS_WRITE_SCOPES),
+  addDimensionGroup: write(SHEETS_WRITE_SCOPES),
+  deleteDimensionGroup: write(SHEETS_WRITE_SCOPES),
+  updateDimensionGroup: write(SHEETS_WRITE_SCOPES),
+  listDimensionGroups: read(SHEETS_READ_SCOPES),
 
   // ---- Slides ----
   getGoogleSlidesContent: read(SLIDES_READ_SCOPES),
@@ -172,6 +182,10 @@ export const TOOL_META: Record<string, ToolMeta> = {
   moveSlideElement: write(SLIDES_WRITE_SCOPES),
   deleteSlideElement: write(SLIDES_WRITE_SCOPES),
   insertSlidesLocalImage: write(SLIDES_WRITE_SCOPES),
+  setSlideVisibility: write(SLIDES_WRITE_SCOPES),
+  replaceSlideImage: write(SLIDES_WRITE_SCOPES),
+  setElementZOrder: write(SLIDES_WRITE_SCOPES),
+  setElementText: write(SLIDES_WRITE_SCOPES),
 
   // ---- Calendar ----
   listCalendars: read(CAL_READ_SCOPES),

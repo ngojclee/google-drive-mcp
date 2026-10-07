@@ -111,6 +111,79 @@ describe('Drive tools', () => {
       assert.equal(args.q, "fullText contains 'report' and trashed = false");
     });
 
+    // --- orderBy tests (issue #167) ---
+
+    it('defaults to modifiedTime desc so results are newest-first', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: { files: [] },
+      }));
+      await callTool(ctx.client, 'search', { query: 'report' });
+      const listCalls = ctx.mocks.drive.tracker.getCalls('files.list');
+      const args = listCalls[listCalls.length - 1].args[0];
+      assert.equal(args.orderBy, 'modifiedTime desc');
+    });
+
+    it('forwards an explicit orderBy', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: { files: [] },
+      }));
+      await callTool(ctx.client, 'search', { query: 'report', orderBy: 'name' });
+      const listCalls = ctx.mocks.drive.tracker.getCalls('files.list');
+      const args = listCalls[listCalls.length - 1].args[0];
+      assert.equal(args.orderBy, 'name');
+    });
+
+    it('applies orderBy on the rawQuery path too', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: { files: [] },
+      }));
+      await callTool(ctx.client, 'search', {
+        query: "mimeType = 'application/pdf'",
+        rawQuery: true,
+        orderBy: 'createdTime desc',
+      });
+      const listCalls = ctx.mocks.drive.tracker.getCalls('files.list');
+      const args = listCalls[listCalls.length - 1].args[0];
+      assert.equal(args.orderBy, 'createdTime desc');
+    });
+
+    it('rejects an unsupported orderBy instead of passing it to Drive', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: { files: [] },
+      }));
+      const res = await callTool(ctx.client, 'search', { query: 'report', orderBy: 'bogus' });
+      assert.equal(res.isError, true);
+      assert.equal(ctx.mocks.drive.tracker.getCalls('files.list').length, 0);
+    });
+
+    it('names the effective ordering in the response', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: { files: [{ id: 'f1', name: 'Report.pdf', mimeType: 'application/pdf' }] },
+      }));
+      const res = await callTool(ctx.client, 'search', { query: 'report' });
+      assert.ok(res.content[0].text!.includes('(ordered by modifiedTime desc)'));
+
+      const named = await callTool(ctx.client, 'search', { query: 'report', orderBy: 'name' });
+      assert.ok(named.content[0].text!.includes('(ordered by name)'));
+      ctx.mocks.drive.service.files.list._resetImpl();
+    });
+
+    it('repeats orderBy in the pagination hint so the next page keeps the ordering', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({
+        data: {
+          files: [{ id: 'f1', name: 'Report.pdf', mimeType: 'application/pdf' }],
+          nextPageToken: 'tok-2',
+        },
+      }));
+      const res = await callTool(ctx.client, 'search', { query: 'report', orderBy: 'name' });
+      const text = res.content[0].text!;
+      // orderBy defaults to `modifiedTime desc`, so a follow-up call carrying only
+      // the token would re-sort page 2. The token also has to end its own line.
+      assert.ok(text.includes('Use pageToken: tok-2\n'));
+      assert.ok(text.includes('Pass orderBy: name again'));
+      ctx.mocks.drive.service.files.list._resetImpl();
+    });
+
     // --- Folder path resolution tests (PR #30) ---
 
     it('resolves folder paths in search results', async () => {
@@ -248,6 +321,23 @@ describe('Drive tools', () => {
       assert.ok(text.includes('Length: 11 characters'));
       assert.ok(text.includes('Truncated: no'));
       assert.ok(text.endsWith('Hello World'));
+    });
+
+    it('reads content delivered as a web ReadableStream (gaxios 7 shape)', async () => {
+      ctx.mocks.drive.service.files.get._setImpl(async (p: any) =>
+        p?.alt === 'media'
+          ? {
+              data: new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode('Hello Web'));
+                  controller.close();
+                },
+              }),
+            }
+          : { data: { id: 'file-1', name: 'notes.txt', mimeType: 'text/plain', parents: ['root'] } });
+      const res = await callTool(ctx.client, 'readTextFile', { fileId: 'file-1' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.endsWith('Hello Web'));
     });
 
     it('reports code-point Length for astral characters (emoji counts as 1)', async () => {
@@ -464,6 +554,103 @@ describe('Drive tools', () => {
       assert.equal('emailAddress' in body, false);
     });
 
+    it('addPermission verifies the applied role: upsert mismatch is corrected once and reported honestly', async () => {
+      // Drive's upsert semantics: the principal already holds writer, so a
+      // reader request comes back role=writer.
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer', emailAddress: 'user@example.com', type: 'user' },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'reader' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'addPermission', {
+          fileId: 'file-1', emailAddress: 'user@example.com', role: 'reader', type: 'user',
+        });
+        assert.equal(res.isError, false);
+        assert.ok(res.content[0].text!.includes("initially applied 'writer'"), res.content[0].text);
+        assert.ok(res.content[0].text!.includes("changed to 'reader'"), res.content[0].text);
+        const updateCalls = ctx.mocks.drive.tracker.getCalls('permissions.update');
+        assert.equal(updateCalls[updateCalls.length - 1].args[0].requestBody.role, 'reader');
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('addPermission reports a surviving mismatch as an error, never as success', async () => {
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer', emailAddress: 'user@example.com', type: 'user' },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'addPermission', {
+          fileId: 'file-1', emailAddress: 'user@example.com', role: 'reader', type: 'user',
+        });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('MISMATCH'));
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('updatePermission verifies the response role', async () => {
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-1', role: 'writer' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'updatePermission', {
+          fileId: 'file-1', permissionId: 'perm-1', role: 'commenter',
+        });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('MISMATCH'));
+      } finally {
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('addPermission reports a failed corrective update as an error that names the failure', async () => {
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer', emailAddress: 'user@example.com', type: 'user' },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => {
+        throw new Error('insufficientFilePermissions');
+      });
+      try {
+        const res = await callTool(ctx.client, 'addPermission', {
+          fileId: 'file-1', emailAddress: 'user@example.com', role: 'reader', type: 'user',
+        });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('MISMATCH'), res.content[0].text);
+        assert.ok(res.content[0].text!.includes('corrective update failed: insufficientFilePermissions'), res.content[0].text);
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('addPermission treats a response without a role as a mismatch, like updatePermission does', async () => {
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', emailAddress: 'user@example.com', type: 'user' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'addPermission', {
+          fileId: 'file-1', emailAddress: 'user@example.com', role: 'reader', type: 'user',
+        });
+        // The default update mock echoes the requested role, so the correction succeeds.
+        assert.equal(res.isError, false, res.content[0].text);
+        assert.ok(res.content[0].text!.includes('initially applied no role'), res.content[0].text);
+        const updateCalls = ctx.mocks.drive.tracker.getCalls('permissions.update');
+        assert.equal(updateCalls.length, 1);
+        assert.equal(updateCalls[0].args[0].requestBody.role, 'reader');
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+      }
+    });
+
     it('addPermission type "user" without emailAddress is rejected before any API call', async () => {
       const res = await callTool(ctx.client, 'addPermission', {
         fileId: 'file-1', type: 'user', role: 'reader',
@@ -544,10 +731,18 @@ describe('Drive tools', () => {
     });
 
     it('updatePermission happy path', async () => {
-      const res = await callTool(ctx.client, 'updatePermission', {
-        fileId: 'file-1', permissionId: 'perm-1', role: 'commenter',
-      });
-      assert.equal(res.isError, false);
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-1', role: 'commenter', emailAddress: 'user@example.com', type: 'user' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'updatePermission', {
+          fileId: 'file-1', permissionId: 'perm-1', role: 'commenter',
+        });
+        assert.equal(res.isError, false);
+        assert.ok(res.content[0].text!.includes('perm-1 => commenter'), res.content[0].text);
+      } finally {
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
     });
 
     it('removePermission happy path', async () => {
@@ -578,6 +773,73 @@ describe('Drive tools', () => {
 
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('No changes needed'));
+    });
+
+    it('shareFile reports a mismatched role on the update path as an error', async () => {
+      ctx.mocks.drive.service.permissions.list._setImpl(async () => ({
+        data: { permissions: [{ id: 'perm-1', type: 'user', emailAddress: 'user@example.com', role: 'reader' }] },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-1', role: 'reader', emailAddress: 'user@example.com' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'shareFile', {
+          fileId: 'file-1', emailAddress: 'user@example.com', role: 'writer',
+        });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('MISMATCH'), res.content[0].text);
+        assert.ok(res.content[0].text!.includes("requested 'writer' but Drive reports 'reader'"), res.content[0].text);
+      } finally {
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('shareFile corrects an upsert mismatch on the create path once and reports it', async () => {
+      // No user-type match in the pre-check (e.g. the address is a group), so
+      // shareFile creates — and Drive upserts onto the existing grant.
+      ctx.mocks.drive.service.permissions.list._setImpl(async () => ({ data: { permissions: [] } }));
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer', emailAddress: 'team@example.com', type: 'group' },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'reader' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'shareFile', {
+          fileId: 'file-1', emailAddress: 'team@example.com', role: 'reader',
+        });
+        assert.equal(res.isError, false, res.content[0].text);
+        assert.ok(res.content[0].text!.includes("initially applied 'writer'"), res.content[0].text);
+        assert.ok(res.content[0].text!.includes("changed to 'reader'"), res.content[0].text);
+        const updateCalls = ctx.mocks.drive.tracker.getCalls('permissions.update');
+        assert.equal(updateCalls.length, 1);
+        assert.equal(updateCalls[0].args[0].permissionId, 'perm-9');
+        assert.equal(updateCalls[0].args[0].requestBody.role, 'reader');
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
+    });
+
+    it('shareFile reports a surviving mismatch on the create path as an error', async () => {
+      ctx.mocks.drive.service.permissions.list._setImpl(async () => ({ data: { permissions: [] } }));
+      ctx.mocks.drive.service.permissions.create._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer', emailAddress: 'team@example.com', type: 'group' },
+      }));
+      ctx.mocks.drive.service.permissions.update._setImpl(async () => ({
+        data: { id: 'perm-9', role: 'writer' },
+      }));
+      try {
+        const res = await callTool(ctx.client, 'shareFile', {
+          fileId: 'file-1', emailAddress: 'team@example.com', role: 'reader',
+        });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('MISMATCH'), res.content[0].text);
+        assert.ok(res.content[0].text!.includes('even after a corrective update'), res.content[0].text);
+      } finally {
+        ctx.mocks.drive.service.permissions.create._resetImpl();
+        ctx.mocks.drive.service.permissions.update._resetImpl();
+      }
     });
 
     it('addPermission forwards emailMessage to permissions.create', async () => {

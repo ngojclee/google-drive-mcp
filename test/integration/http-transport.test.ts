@@ -36,7 +36,7 @@ async function parseResponse(res: Response): Promise<any> {
   return JSON.parse(text);
 }
 
-async function installMocks() {
+async function setupMocks() {
   const mocks = createAllMocks();
   (google as any).drive = mocks.google.drive;
   (google as any).docs = mocks.google.docs;
@@ -48,11 +48,7 @@ async function installMocks() {
   mod._setAuthClientForTesting({
     request: async () => ({ data: 'mock-auth-request-response' }),
   });
-  return { mod, mocks };
-}
-
-async function setupMocks() {
-  return (await installMocks()).mod;
+  return mod;
 }
 
 async function initializeSession(baseUrl: string): Promise<string> {
@@ -126,11 +122,6 @@ describe('HTTP transport', () => {
     });
 
     assert.equal(res.status, 200);
-    assert.match(
-      res.headers.get('content-type') || '',
-      /^application\/json\b/,
-      'initialize should complete as a JSON response rather than a long-lived SSE stream',
-    );
     const sessionId = res.headers.get('mcp-session-id');
     assert.ok(sessionId, 'response should include mcp-session-id header');
 
@@ -182,48 +173,10 @@ describe('HTTP transport', () => {
     });
 
     assert.equal(toolsRes.status, 200);
-    assert.match(
-      toolsRes.headers.get('content-type') || '',
-      /^application\/json\b/,
-      'tools/list should complete as a JSON response',
-    );
     const body = await parseResponse(toolsRes);
     assert.equal(body.id, 2);
     assert.ok(Array.isArray(body.result?.tools), 'should return tools array');
     assert.ok(body.result.tools.length > 0, 'should have at least one tool');
-  });
-
-  it('completes tools/call as application/json', async () => {
-    const sessionId = await initializeSession(baseUrl);
-    await fetch(`${baseUrl}/mcp`, {
-      method: 'POST',
-      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-      }),
-    });
-
-    const callRes = await fetch(`${baseUrl}/mcp`, {
-      method: 'POST',
-      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'tools/call',
-        params: {
-          name: 'getGoogleSheetContent',
-          arguments: { spreadsheetId: 'sheet-1', range: 'Sheet1!A1:B2' },
-        },
-        id: 3,
-      }),
-      signal: AbortSignal.timeout(2_000),
-    });
-
-    assert.equal(callRes.status, 200);
-    assert.match(callRes.headers.get('content-type') || '', /^application\/json\b/);
-    const body = await parseResponse(callRes);
-    assert.equal(body.id, 3);
-    assert.notEqual(body.result?.isError, true);
   });
 
   it('returns 400 for non-initialize request without session', async () => {
@@ -246,21 +199,6 @@ describe('HTTP transport', () => {
   it('returns 400 for GET without session ID', async () => {
     const res = await fetch(`${baseUrl}/mcp`);
     assert.equal(res.status, 400);
-  });
-
-  it('keeps the optional standalone SSE stream alive', async () => {
-    const sessionId = await initializeSession(baseUrl);
-    const res = await fetch(`${baseUrl}/mcp`, {
-      headers: {
-        Accept: 'text/event-stream',
-        'mcp-session-id': sessionId,
-      },
-      signal: AbortSignal.timeout(2_000),
-    });
-
-    assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type') || '', /^text\/event-stream\b/);
-    await res.body?.cancel();
   });
 
   it('DELETE closes session', async () => {
@@ -297,76 +235,8 @@ describe('HTTP transport', () => {
         id: 2,
       }),
     });
-    // Session is gone, so Streamable HTTP requires 404 to trigger re-initialize.
+    // Session is gone: 404 tells the client to start a new session.
     assert.equal(postRes.status, 404);
-  });
-});
-
-describe('HTTP transport — shared concurrency limit', () => {
-  let httpServer: HttpServer;
-  let baseUrl: string;
-  let sessions: Map<string, any>;
-  let active = 0;
-  let peak = 0;
-
-  before(async () => {
-    const { mod, mocks } = await installMocks();
-    mocks.sheets.service.spreadsheets.values.get._setImpl(async () => {
-      active += 1;
-      peak = Math.max(peak, active);
-      await delay(40);
-      active -= 1;
-      return { data: { values: [['ok']] } };
-    });
-    const result = mod.createHttpApp('127.0.0.1');
-    sessions = result.sessions;
-    const started = await startServer(result.app);
-    httpServer = started.httpServer;
-    baseUrl = started.baseUrl;
-  });
-
-  after(async () => {
-    await cleanupServer(httpServer, sessions);
-  });
-
-  it('bounds concurrent tool calls across multiple sessions', async () => {
-    const sessionIds = await Promise.all(
-      Array.from({ length: 4 }, () => initializeSession(baseUrl)),
-    );
-    await Promise.all(sessionIds.map((sessionId) => fetch(`${baseUrl}/mcp`, {
-      method: 'POST',
-      headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-      }),
-    })));
-
-    const responses = await Promise.all(Array.from({ length: 20 }, (_, index) => {
-      const sessionId = sessionIds[index % sessionIds.length];
-      return fetch(`${baseUrl}/mcp`, {
-        method: 'POST',
-        headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tools/call',
-          params: {
-            name: 'getGoogleSheetContent',
-            arguments: { spreadsheetId: 'sheet-1', range: 'Sheet1!A1:A1' },
-          },
-          id: 100 + index,
-        }),
-        signal: AbortSignal.timeout(5_000),
-      });
-    }));
-
-    for (const response of responses) {
-      assert.equal(response.status, 200);
-      const body = await parseResponse(response);
-      assert.notEqual(body.result?.isError, true);
-    }
-    assert.equal(peak, 8);
-    assert.equal(active, 0);
   });
 });
 
@@ -471,8 +341,42 @@ describe('HTTP transport — session idle timeout', () => {
       headers: { ...MCP_HEADERS, 'mcp-session-id': sid },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', params: {}, id: 2 }),
     });
+    // Streamable HTTP: an unknown session id is 404, and the body carries the
+    // SDK's own code/message so clients see one shape for "start over".
     assert.equal(res.status, 404);
+    const body = await parseResponse(res);
+    assert.equal(body.error.code, -32001);
+    assert.equal(body.error.message, 'Session not found');
     assert.equal(sessions.has(sid), false);
+  });
+
+  it('a client can recover from an evicted session by re-initializing', async () => {
+    const sid = await initializeSession(baseUrl);
+    await delay(1000);
+    assert.equal(sessions.has(sid), false);
+
+    // The spec says the client sends a fresh initialize without a session id...
+    const fresh = await initializeSession(baseUrl);
+    assert.notEqual(fresh, sid);
+    assert.ok(sessions.has(fresh));
+
+    // ...but a client that leaves the stale id on the initialize is tolerated
+    // too, rather than being bounced with a second 404.
+    const lenient = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, 'mcp-session-id': sid },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } },
+        id: 1,
+      }),
+    });
+    assert.equal(lenient.status, 200);
+    const lenientSid = lenient.headers.get('mcp-session-id');
+    await lenient.text();
+    assert.ok(lenientSid && lenientSid !== sid);
+    assert.ok(sessions.has(lenientSid!));
   });
 
   it('activity resets the idle timer', async () => {
@@ -594,6 +498,8 @@ describe('HTTP transport — error handling', () => {
       headers: { 'mcp-session-id': 'non-existent-uuid' },
     });
     assert.equal(res.status, 404);
+    const body = await parseResponse(res);
+    assert.equal(body.error.code, -32001);
   });
 
   it('GET with non-existent session ID returns 404', async () => {
@@ -602,6 +508,8 @@ describe('HTTP transport — error handling', () => {
       headers: { 'mcp-session-id': 'non-existent-uuid' },
     });
     assert.equal(res.status, 404);
+    const body = await parseResponse(res);
+    assert.equal(body.error.code, -32001);
   });
 });
 

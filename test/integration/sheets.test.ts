@@ -57,16 +57,89 @@ describe('Sheets tools', () => {
       const res = await callTool(ctx.client, 'updateGoogleSheet', {});
       assert.equal(res.isError, true);
     });
+  });
 
-    it('rejects oversized writes before calling Google', async () => {
-      const res = await callTool(ctx.client, 'updateGoogleSheet', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!A1',
-        data: Array.from({ length: 5_001 }, () => ['x']),
+  // --- batchUpdateGoogleSheetValues ---
+  describe('batchUpdateGoogleSheetValues', () => {
+    const twoUpdates = [
+      { range: 'Sheet1!A1:B2', values: [['a', 'b'], ['1', '2']] },
+      { range: 'Sheet2!C1', values: [['=SUM(A1:A10)']] },
+    ];
+
+    it('sends every range in one values.batchUpdate call', async () => {
+      const res = await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: twoUpdates,
+      });
+      assert.equal(res.isError, false);
+      // The whole point of the tool: N ranges cost one API round trip, not N.
+      assert.equal(ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.update').length, 0);
+      const calls = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.batchUpdate');
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].args[0].requestBody.data, twoUpdates);
+    });
+
+    it('passes USER_ENTERED through so formulas land as formulas', async () => {
+      await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: twoUpdates, valueInputOption: 'USER_ENTERED',
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.batchUpdate')[0];
+      assert.equal(call.args[0].requestBody.valueInputOption, 'USER_ENTERED');
+    });
+
+    it('defaults to RAW when valueInputOption is omitted', async () => {
+      await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: twoUpdates,
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.batchUpdate')[0];
+      assert.equal(call.args[0].requestBody.valueInputOption, 'RAW');
+    });
+
+    it('reports the cell and range counts the API returned', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.batchUpdate._setImpl(async () => ({
+        data: {
+          totalUpdatedCells: 7,
+          responses: [{ updatedRange: 'Sheet1!A1:B2' }, { updatedRange: 'Sheet2!C1' }],
+        },
+      }));
+      const res = await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: twoUpdates,
+      });
+      assert.equal(res.isError, false);
+      assert.match(res.content[0].text!, /7 cell/);
+      assert.match(res.content[0].text!, /2 range/);
+    });
+
+    it('lists the first 10 ranges and summarises the rest', async () => {
+      const responses = Array.from({ length: 12 }, (_, i) => ({ updatedRange: `Sheet1!A${i + 1}` }));
+      ctx.mocks.sheets.service.spreadsheets.values.batchUpdate._setImpl(async () => ({
+        data: { totalUpdatedCells: 12, responses },
+      }));
+      const res = await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: twoUpdates,
+      });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.match(text, /12 range/);
+      assert.match(text, /Sheet1!A10, \+2 more/);
+      assert.doesNotMatch(text, /Sheet1!A11/);
+    });
+
+    // Asserting on the message, not just isError: an unknown tool also reports
+    // isError, so a bare flag check would pass before the tool even exists.
+    it('rejects an empty updates array', async () => {
+      const res = await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        spreadsheetId: 'sheet-1', updates: [],
       });
       assert.equal(res.isError, true);
-      assert.ok(res.content[0].text!.includes('Split the write into chunks'));
-      assert.equal(ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.update').length, 0);
+      assert.match(res.content[0].text!, /at least one update/i);
+    });
+
+    it('rejects a missing spreadsheetId', async () => {
+      const res = await callTool(ctx.client, 'batchUpdateGoogleSheetValues', {
+        updates: twoUpdates,
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /spreadsheet id/i);
     });
   });
 
@@ -81,93 +154,11 @@ describe('Sheets tools', () => {
       });
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('Alice'));
-      assert.ok(res.content[0].text!.includes('returnedRows=2'));
-      assert.ok(res.content[0].text!.includes('truncated=no'));
     });
 
     it('validation error', async () => {
       const res = await callTool(ctx.client, 'getGoogleSheetContent', {});
       assert.equal(res.isError, true);
-    });
-
-    it('bounds an open-ended range and returns nextRange', async () => {
-      const rows = Array.from({ length: 3 }, (_, index) => [`row-${index + 1}`]);
-      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
-        data: { values: rows },
-      }));
-
-      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!A:A',
-        maxRows: 3,
-      });
-
-      assert.equal(res.isError, false);
-      const calls = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get');
-      const call = calls[calls.length - 1];
-      assert.equal(call?.args[0].range, 'Sheet1!A1:A3');
-      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A4:A6'));
-    });
-
-    it('clamps rows to the maxCells budget', async () => {
-      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
-        data: { values: [['a', 'b'], ['c', 'd']] },
-      }));
-
-      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!A1:B100',
-        maxRows: 100,
-        maxCells: 4,
-      });
-
-      assert.equal(res.isError, false);
-      const calls = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get');
-      const call = calls[calls.length - 1];
-      assert.equal(call?.args[0].range, 'Sheet1!A1:B2');
-      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A3:B4'));
-    });
-
-    it('rejects full-row ranges that cannot be safely bounded by columns', async () => {
-      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!1:100',
-      });
-      assert.equal(res.isError, true);
-      assert.ok(res.content[0].text!.includes('explicit column range'));
-    });
-
-    it('stops before the output character limit and returns a continuation range', async () => {
-      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
-        data: { values: Array.from({ length: 20 }, () => ['x'.repeat(200)]) },
-      }));
-
-      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!A1:A20',
-        maxOutputChars: 1_000,
-      });
-
-      assert.equal(res.isError, false);
-      assert.ok(res.content[0].text!.length <= 1_000);
-      assert.ok(res.content[0].text!.includes('truncated=yes'));
-      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A3:A20'));
-    });
-
-    it('advances past a single row that exceeds the output budget', async () => {
-      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
-        data: { values: [['x'.repeat(2_000)], ['next']] },
-      }));
-
-      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
-        spreadsheetId: 'sheet-1',
-        range: 'Sheet1!A1:A2',
-        maxOutputChars: 1_000,
-      });
-
-      assert.equal(res.isError, false);
-      assert.ok(res.content[0].text!.includes('Row 1: [omitted'));
-      assert.ok(res.content[0].text!.includes('nextRange=Sheet1!A2:A2'));
     });
   });
 
@@ -592,6 +583,18 @@ describe('Sheets tools', () => {
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('Budget'));
     });
+
+    it('defaults to modifiedTime desc, not oldest-first (issue #167)', async () => {
+      ctx.mocks.drive.service.files.list._setImpl(async () => ({ data: { files: [] } }));
+      await callTool(ctx.client, 'listGoogleSheets', {});
+      const listCalls = ctx.mocks.drive.tracker.getCalls('files.list');
+      assert.equal(listCalls[listCalls.length - 1].args[0].orderBy, 'modifiedTime desc');
+
+      await callTool(ctx.client, 'listGoogleSheets', { orderBy: 'name' });
+      const afterExplicit = ctx.mocks.drive.tracker.getCalls('files.list');
+      assert.equal(afterExplicit[afterExplicit.length - 1].args[0].orderBy, 'name');
+      ctx.mocks.drive.service.files.list._resetImpl();
+    });
   });
 
   // --- copyFile ---
@@ -607,6 +610,273 @@ describe('Sheets tools', () => {
 
     it('validation error', async () => {
       const res = await callTool(ctx.client, 'copyFile', {});
+      assert.equal(res.isError, true);
+    });
+  });
+
+  // --- getGoogleSheetContent: valueRenderOption ---
+  describe('getGoogleSheetContent valueRenderOption', () => {
+    it('requests formulas when valueRenderOption is FORMULA', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: [['=SUM(A1:A10)']] },
+      }));
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1', range: 'Sheet1!B1', valueRenderOption: 'FORMULA',
+      });
+      assert.equal(res.isError, false);
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get')[0];
+      assert.equal(call.args[0].valueRenderOption, 'FORMULA');
+      assert.ok(res.content[0].text!.includes('=SUM(A1:A10)'));
+    });
+
+    it('defaults to FORMATTED_VALUE when omitted', async () => {
+      await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1', range: 'Sheet1!A1:B2',
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.values.get')[0];
+      assert.equal(call.args[0].valueRenderOption, 'FORMATTED_VALUE');
+    });
+
+    it('rejects an unknown render option', async () => {
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1', range: 'Sheet1!A1:B2', valueRenderOption: 'FORMULAS',
+      });
+      assert.equal(res.isError, true);
+    });
+
+    // A comma-space separator cannot be told apart from a comma-space inside a
+    // cell, so rows are tab-separated under every render option.
+    it('keeps a formula containing ", " in one cell', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: [['=IF(A1>0, "yes", "no")', '=SUM(A1, B1)']] },
+      }));
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1', range: 'Sheet1!B1:C1', valueRenderOption: 'FORMULA',
+      });
+      assert.equal(res.isError, false);
+      const row = res.content[0].text!.split('\n').find(l => l.startsWith('Row 1: '))!;
+      assert.deepEqual(row.slice('Row 1: '.length).split('\t'), [
+        '=IF(A1>0, "yes", "no")',
+        '=SUM(A1, B1)',
+      ]);
+    });
+
+    it('keeps a prose cell containing ", " in one cell under the default render option', async () => {
+      ctx.mocks.sheets.service.spreadsheets.values.get._setImpl(async () => ({
+        data: { values: [['North', '$1,234.56', 'Up, but slowing']] },
+      }));
+      const res = await callTool(ctx.client, 'getGoogleSheetContent', {
+        spreadsheetId: 'sheet-1', range: 'Sheet1!A2:C2',
+      });
+      assert.equal(res.isError, false);
+      const row = res.content[0].text!.split('\n').find(l => l.startsWith('Row 1: '))!;
+      assert.deepEqual(row.slice('Row 1: '.length).split('\t'), [
+        'North',
+        '$1,234.56',
+        'Up, but slowing',
+      ]);
+    });
+  });
+
+  // --- addDimensionGroup ---
+  describe('addDimensionGroup', () => {
+    it('groups rows over the 0-based half-open range it was given', async () => {
+      const res = await callTool(ctx.client, 'addDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12,
+      });
+      assert.equal(res.isError, false);
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      assert.deepEqual(call.args[0].requestBody.requests[0], {
+        addDimensionGroup: {
+          range: { sheetId: 0, dimension: 'ROWS', startIndex: 4, endIndex: 12 },
+        },
+      });
+    });
+
+    it('groups columns on a non-zero sheet id', async () => {
+      await callTool(ctx.client, 'addDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 7,
+        dimension: 'COLUMNS', startIndex: 2, endIndex: 6,
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      assert.deepEqual(call.args[0].requestBody.requests[0].addDimensionGroup.range, {
+        sheetId: 7, dimension: 'COLUMNS', startIndex: 2, endIndex: 6,
+      });
+    });
+
+    it('rejects an empty range', async () => {
+      const res = await callTool(ctx.client, 'addDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 5, endIndex: 5,
+      });
+      assert.equal(res.isError, true);
+      assert.equal(ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate').length, 0);
+    });
+
+    it('rejects a negative start index', async () => {
+      const res = await callTool(ctx.client, 'addDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: -1, endIndex: 5,
+      });
+      assert.equal(res.isError, true);
+    });
+
+    it('validation error', async () => {
+      const res = await callTool(ctx.client, 'addDimensionGroup', {});
+      assert.equal(res.isError, true);
+    });
+  });
+
+  // --- deleteDimensionGroup ---
+  describe('deleteDimensionGroup', () => {
+    it('sends a deleteDimensionGroup request for the range', async () => {
+      const res = await callTool(ctx.client, 'deleteDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12,
+      });
+      assert.equal(res.isError, false);
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      assert.deepEqual(call.args[0].requestBody.requests[0], {
+        deleteDimensionGroup: {
+          range: { sheetId: 0, dimension: 'ROWS', startIndex: 4, endIndex: 12 },
+        },
+      });
+    });
+
+    it('validation error', async () => {
+      const res = await callTool(ctx.client, 'deleteDimensionGroup', {});
+      assert.equal(res.isError, true);
+    });
+  });
+
+  // --- updateDimensionGroup ---
+  describe('updateDimensionGroup', () => {
+    it('collapses a group at a given depth', async () => {
+      const res = await callTool(ctx.client, 'updateDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12, depth: 1, collapsed: true,
+      });
+      assert.equal(res.isError, false);
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      assert.deepEqual(call.args[0].requestBody.requests[0], {
+        updateDimensionGroup: {
+          dimensionGroup: {
+            range: { sheetId: 0, dimension: 'ROWS', startIndex: 4, endIndex: 12 },
+            depth: 1,
+            collapsed: true,
+          },
+          fields: 'collapsed',
+        },
+      });
+    });
+
+    it('expands a group when collapsed is false', async () => {
+      await callTool(ctx.client, 'updateDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12, depth: 2, collapsed: false,
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      const group = call.args[0].requestBody.requests[0].updateDimensionGroup.dimensionGroup;
+      assert.equal(group.collapsed, false);
+      assert.equal(group.depth, 2);
+    });
+
+    it('defaults to depth 1 when depth is omitted', async () => {
+      await callTool(ctx.client, 'updateDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12, collapsed: true,
+      });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.batchUpdate')[0];
+      assert.equal(call.args[0].requestBody.requests[0].updateDimensionGroup.dimensionGroup.depth, 1);
+    });
+
+    it('validation error when collapsed is missing', async () => {
+      const res = await callTool(ctx.client, 'updateDimensionGroup', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+        dimension: 'ROWS', startIndex: 4, endIndex: 12, depth: 1,
+      });
+      assert.equal(res.isError, true);
+    });
+  });
+
+  // --- listDimensionGroups ---
+  describe('listDimensionGroups', () => {
+    function setupGroupsMock() {
+      ctx.mocks.sheets.service.spreadsheets.get._setImpl(async () => ({
+        data: {
+          spreadsheetId: 'sheet-1',
+          sheets: [
+            {
+              properties: { sheetId: 0, title: 'Sheet1' },
+              rowGroups: [
+                { range: { startIndex: 4, endIndex: 12 }, depth: 1, collapsed: true },
+                { range: { startIndex: 6, endIndex: 9 }, depth: 2, collapsed: false },
+              ],
+              columnGroups: [
+                { range: { startIndex: 2, endIndex: 6 }, depth: 1, collapsed: false },
+              ],
+            },
+          ],
+        },
+      }));
+    }
+
+    it('reports group ranges as 0-based half-open intervals', async () => {
+      setupGroupsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', { spreadsheetId: 'sheet-1' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('rows [4, 12)'), res.content[0].text!);
+      assert.ok(res.content[0].text!.includes('columns [2, 6)'), res.content[0].text!);
+    });
+
+    it('reports depth and collapsed state', async () => {
+      setupGroupsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', { spreadsheetId: 'sheet-1' });
+      assert.ok(res.content[0].text!.includes('depth 2'), res.content[0].text!);
+      assert.ok(/collapsed/i.test(res.content[0].text!));
+    });
+
+    it('reports the sheet id so the range can be fed back to the group tools', async () => {
+      setupGroupsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', { spreadsheetId: 'sheet-1' });
+      assert.ok(res.content[0].text!.includes('sheetId: 0'), res.content[0].text!);
+    });
+
+    it('asks the API for the group fields', async () => {
+      setupGroupsMock();
+      await callTool(ctx.client, 'listDimensionGroups', { spreadsheetId: 'sheet-1' });
+      const call = ctx.mocks.sheets.tracker.getCalls('spreadsheets.get')[0];
+      assert.match(call.args[0].fields, /rowGroups/);
+      assert.match(call.args[0].fields, /columnGroups/);
+    });
+
+    it('limits the listing to one sheet id', async () => {
+      setupGroupsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', {
+        spreadsheetId: 'sheet-1', sheetId: 0,
+      });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('Sheet1'));
+    });
+
+    it('says so when a sheet has no groups', async () => {
+      setupSheetsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', { spreadsheetId: 'sheet-1' });
+      assert.equal(res.isError, false);
+      assert.ok(/no groups/i.test(res.content[0].text!), res.content[0].text!);
+    });
+
+    it('reports an unknown sheet id', async () => {
+      setupGroupsMock();
+      const res = await callTool(ctx.client, 'listDimensionGroups', {
+        spreadsheetId: 'sheet-1', sheetId: 42,
+      });
+      assert.equal(res.isError, true);
+    });
+
+    it('validation error', async () => {
+      const res = await callTool(ctx.client, 'listDimensionGroups', {});
       assert.equal(res.isError, true);
     });
   });

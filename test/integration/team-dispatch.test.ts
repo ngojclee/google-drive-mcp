@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { after, before, describe, it, mock } from 'node:test';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Server as HttpServer } from 'node:http';
 import { google } from 'googleapis';
@@ -287,6 +287,35 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
     assert.equal(driveAuths.length, 2);
   });
 
+  it('attributes dispatch and session logs to the acting user (sub + email)', async () => {
+    const bearer = await signIn({ sub: 'sub-carol', email: 'carol@corp.example', scope: DRIVE_SCOPE });
+    // log() writes through console.error; capture it around a session + call.
+    const errMock = mock.method(console, 'error', () => {});
+    try {
+      const sid = await initSession(bearer);
+      await (await mcpPost(bearer, sid, toolsCall('search', { query: 'audit' }))).text();
+      const lines = errMock.mock.calls.map((c) => c.arguments.join(' '));
+
+      const created = lines.find((l) => l.includes('New session created'));
+      assert.ok(created, 'session creation is logged');
+      assert.ok(
+        created!.includes('"sub":"sub-carol"') && created!.includes('"email":"carol@corp.example"'),
+        `session line names the user (got: ${created})`,
+      );
+
+      const dispatch = lines.find(
+        (l) => l.includes('Handling tool request (team)') && l.includes('"tool":"search"'),
+      );
+      assert.ok(dispatch, 'team dispatch is logged');
+      assert.ok(
+        dispatch!.includes('"sub":"sub-carol"') && dispatch!.includes('"email":"carol@corp.example"'),
+        `dispatch line names the user (got: ${dispatch})`,
+      );
+    } finally {
+      errMock.mock.restore();
+    }
+  });
+
   it('rejects the account argument and manage_accounts outright', async () => {
     const bearer = await signIn({ sub: 'sub-alice', email: 'alice@corp.example', scope: DRIVE_SCOPE });
     const sid = await initSession(bearer);
@@ -309,11 +338,13 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
     const bob = await signIn({ sub: 'sub-bob', email: 'bob@corp.example', scope: DRIVE_SCOPE });
     const aliceSid = await initSession(alice);
 
-    // POST with a non-initialize body: indistinguishable from an unknown session.
+    // POST with a non-initialize body: indistinguishable from an unknown
+    // session, which is a 404 "Session not found".
     const post = await mcpPost(bob, aliceSid, { jsonrpc: '2.0', method: 'tools/list', id: 2 });
     assert.equal(post.status, 404);
     const postBody = await post.json();
-    assert.match(postBody.error.message, /Session not found/);
+    assert.equal(postBody.error.code, -32001);
+    assert.equal(postBody.error.message, 'Session not found');
 
     // GET (SSE stream) and DELETE: same 404 as an unknown session.
     const get = await fetch(`${baseUrl}/mcp`, {
@@ -395,8 +426,13 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
     client.setCredentials({ ...client.credentials, expiry_date: Date.now() - 60_000 });
     (client as unknown as { refreshAccessToken: () => Promise<never> }).refreshAccessToken =
       async () => {
-        const err = new Error('invalid_grant') as Error & { response?: { data?: { error?: string } } };
-        err.response = { data: { error: 'invalid_grant' } };
+        // gaxios-7-realistic shape: top-level `status` plus the parsed body.
+        const err = new Error('invalid_grant') as Error & {
+          status?: number;
+          response?: { status?: number; data?: { error?: string } };
+        };
+        err.status = 400;
+        err.response = { status: 400, data: { error: 'invalid_grant' } };
         throw err;
       };
 

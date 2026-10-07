@@ -3,10 +3,13 @@ import { z } from 'zod';
 import JSZip from 'jszip';
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
 import { errorResponse } from '../types.js';
-import { escapeDriveQuery, isTextMime, ALL_DRIVES_LIST_PARAMS } from '../utils.js';
+import { escapeDriveQuery, isTextMime, ALL_DRIVES_LIST_PARAMS, DRIVE_ORDER_BY_VALUES } from '../utils.js';
 import { downloadTextContent, writeTextContent } from './text-content.js';
 import { uploadImageToDrive } from '../utils/driveImageUpload.js';
-import { withRetry } from '../utils/retry.js';
+import { withRetry, UPLOAD_TIMEOUT_MS } from '../utils/retry.js';
+import { getResponseHeader } from '../utils/streams.js';
+import { describeRangeStyles, paragraphMetaBits, rgbColorToHex, summarizeDocumentStyles, type StyleSummarySegment } from './styleProjection.js';
+import { collectDocPlainText, countOccurrences, diagnoseZeroMatch, findOccurrenceRanges, buildMultilineReplaceRequests } from './findDiagnostics.js';
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -25,25 +28,17 @@ function hexToRgbColor(hex: string): { red: number; green: number; blue: number 
   if (hexClean.length === 3) {
     hexClean = hexClean[0] + hexClean[0] + hexClean[1] + hexClean[1] + hexClean[2] + hexClean[2];
   }
-  if (hexClean.length !== 6) return null;
+  // Require every character to be a hex digit. parseInt stops at the first
+  // non-hex character, so "#12345G" would otherwise pass the length check and
+  // silently become #012345.
+  if (!/^[0-9a-fA-F]{6}$/.test(hexClean)) return null;
   const bigint = parseInt(hexClean, 16);
-  if (isNaN(bigint)) return null;
 
   const r = ((bigint >> 16) & 255) / 255;
   const g = ((bigint >> 8) & 255) / 255;
   const b = (bigint & 255) / 255;
 
   return { red: r, green: g, blue: b };
-}
-
-// Inverse of hexToRgbColor – converts Google Docs API color object to hex string
-function rgbColorToHex(color: any): string | null {
-  if (!color?.color?.rgbColor) return null;
-  const rgb = color.color.rgbColor;
-  const r = Math.round((rgb.red || 0) * 255);
-  const g = Math.round((rgb.green || 0) * 255);
-  const b = Math.round((rgb.blue || 0) * 255);
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
 }
 
 // Helper to recursively collect all tabs with their nesting level
@@ -167,18 +162,255 @@ function renderImageMarkdown(meta: InlineImageMeta | null): string {
   return `![${alt}](${escapeMarkdownUri(uri)} "objectId=${meta.objectId}")`;
 }
 
-// Extract plain text from body content (paragraphs + tables). Inline images are
+// Render a non-textRun paragraph element (person chip, rich link, image,
+// footnote reference, horizontal rule) as text, or null when the element type
+// carries no text. Shared by the markdown reader and the indexed reader; only
+// image rendering differs between them.
+function resolveInlineElementText(
+  el: any,
+  inlineObjects?: any,
+  format: 'text' | 'markdown' = 'text'
+): string | null {
+  if (el.person?.personProperties) {
+    const p = el.person.personProperties;
+    if (p.name && p.email) return `@${p.name} (${p.email})`;
+    return `@${p.name || p.email || ''}`;
+  }
+  if (el.richLink?.richLinkProperties) {
+    const rl = el.richLink.richLinkProperties;
+    const title = escapeBrackets(rl.title || rl.uri || '');
+    const uri = rl.uri;
+    return title && uri ? `[${title}](${uri})` : title || null;
+  }
+  if (el.inlineObjectElement?.inlineObjectId) {
+    const meta = getInlineImageMeta(el.inlineObjectElement.inlineObjectId, inlineObjects);
+    return format === 'markdown' ? renderImageMarkdown(meta) : renderImagePlaceholder(meta);
+  }
+  if (el.footnoteReference) {
+    return `[^${el.footnoteReference.footnoteNumber || ''}]`;
+  }
+  if (el.horizontalRule) {
+    return '---\n';
+  }
+  return null;
+}
+
+// Google Docs named paragraph styles that map onto ATX headings. TITLE and
+// SUBTITLE have no exact ATX equivalent, but leaving them unmapped drops the
+// most prominent heading in the document from the outline entirely.
+const MARKDOWN_HEADING_PREFIX: Record<string, string> = {
+  TITLE: '#',
+  SUBTITLE: '##',
+  HEADING_1: '#',
+  HEADING_2: '##',
+  HEADING_3: '###',
+  HEADING_4: '####',
+  HEADING_5: '#####',
+  HEADING_6: '######',
+};
+
+// `# ` / `## ` / … for a heading paragraph, '' for body text.
+function markdownHeadingPrefix(paragraph: any): string {
+  const hashes = MARKDOWN_HEADING_PREFIX[paragraph?.paragraphStyle?.namedStyleType];
+  return hashes ? `${hashes} ` : '';
+}
+
+// `- ` / `1. ` for a list paragraph, indented to its parent item's content
+// column. The indent has to be measured, not assumed: a fixed two spaces per
+// level is short of the three an ordered `1. ` parent needs, and CommonMark
+// reads an under-indented child as a sibling list rather than a nested one.
+// Marker widths are recorded per list as the levels are encountered, so a
+// child always knows how wide its actual ancestors were.
+function createListPrefixer(lists?: any) {
+  const markerWidths = new Map<string, number[]>();
+
+  return (paragraph: any): string => {
+    const bullet = paragraph?.bullet;
+    if (!bullet) return '';
+    const nestingLevel = bullet.nestingLevel ?? 0;
+    const level = lists?.[bullet.listId]?.listProperties?.nestingLevels?.[nestingLevel];
+    const glyphType = level?.glyphType;
+    const ordered = !!glyphType && glyphType !== 'NONE' && glyphType !== 'GLYPH_TYPE_UNSPECIFIED';
+    // Every ordered item is emitted as `1.` — markdown renderers renumber
+    // automatically, and the Docs model has no reliable per-item ordinal here.
+    const marker = ordered ? '1. ' : '- ';
+
+    const widths = markerWidths.get(bullet.listId) ?? [];
+    let indent = 0;
+    for (let i = 0; i < nestingLevel; i++) indent += widths[i] ?? 2;
+    widths[nestingLevel] = marker.length;
+    // Levels deeper than this one are stale once the list comes back up.
+    widths.length = nestingLevel + 1;
+    markerWidths.set(bullet.listId, widths);
+
+    return `${' '.repeat(indent)}${marker}`;
+  };
+}
+
+type EmphasisKey = 'bold' | 'italic' | 'strikethrough';
+
+// Ordered outermost-first, so the markers a run shares with its neighbours are
+// always opened in the same sequence and can stay open across run boundaries.
+const EMPHASIS_MARKERS: Array<{ key: EmphasisKey; marker: string }> = [
+  { key: 'bold', marker: '**' },
+  { key: 'italic', marker: '*' },
+  { key: 'strikethrough', marker: '~~' },
+];
+
+interface MarkdownRun {
+  text: string;
+  keys: EmphasisKey[];
+  // Already-rendered markdown (an image, chip or footnote marker) — never
+  // escaped, never emphasised.
+  literal?: boolean;
+}
+
+function emphasisKeys(textStyle: any): EmphasisKey[] {
+  return EMPHASIS_MARKERS.filter(m => textStyle?.[m.key]).map(m => m.key);
+}
+
+// Escape the inline metacharacters that would otherwise change how the
+// document's own text renders. A literal `*` inside a bold run is the worst
+// case: it pairs with one of the surrounding markers and mangles the span.
+// `_` is only emphasis at a word boundary in CommonMark, so snake_case stays
+// readable.
+function escapeMarkdownText(text: string): string {
+  return text.replace(/[\\`*~[\]]|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/g, m => `\\${m}`);
+}
+
+// Emphasis markers must sit tight against visible text, so whitespace at a
+// styled run's edges — including the paragraph's trailing newline — is pulled
+// out into unstyled runs. Neighbouring runs that share a style set are then
+// merged: Docs splits a visually continuous span at every style boundary, and
+// wrapping each fragment separately produces fused delimiter runs such as
+// `**re*****ally***`, which renders as literal asterisks.
+function normalizeMarkdownRuns(runs: MarkdownRun[]): MarkdownRun[] {
+  const mergeAdjacent = (input: MarkdownRun[]): MarkdownRun[] => {
+    const out: MarkdownRun[] = [];
+    for (const run of input) {
+      const prev = out[out.length - 1];
+      const mergeable =
+        prev && !prev.literal && !run.literal &&
+        prev.keys.length === run.keys.length &&
+        prev.keys.every((k, i) => k === run.keys[i]);
+      if (mergeable) {
+        prev.text += run.text;
+      } else {
+        out.push({ ...run });
+      }
+    }
+    return out;
+  };
+
+  // Coalesce before measuring edges: a span Docs fragmented mid-word has to be
+  // one run first, or the whitespace between the fragments reads as an edge and
+  // the span is split back apart.
+  const split: MarkdownRun[] = [];
+  for (const run of mergeAdjacent(runs)) {
+    if (run.literal) {
+      split.push(run);
+      continue;
+    }
+    if (run.keys.length === 0 || run.text.trim() === '') {
+      split.push({ text: run.text, keys: [] });
+      continue;
+    }
+    const [, lead, core, trail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(run.text) ?? [];
+    if (lead) split.push({ text: lead, keys: [] });
+    split.push({ text: core, keys: run.keys });
+    if (trail) split.push({ text: trail, keys: [] });
+  }
+  return mergeAdjacent(split);
+}
+
+// Render a paragraph's runs, opening and closing emphasis markers across run
+// boundaries so spans nest properly instead of being reopened per run.
+function renderMarkdownRuns(runs: MarkdownRun[]): string {
+  const markerFor = (key: EmphasisKey) => EMPHASIS_MARKERS.find(m => m.key === key)!.marker;
+  let result = '';
+  let open: EmphasisKey[] = [];
+
+  for (const run of normalizeMarkdownRuns(runs)) {
+    const keys = run.literal ? [] : run.keys;
+    // Close markers that are no longer active, plus everything opened after
+    // them — markers only nest, so they close in reverse order.
+    const stale = open.findIndex(k => !keys.includes(k));
+    if (stale !== -1) {
+      for (let i = open.length - 1; i >= stale; i--) result += markerFor(open[i]);
+      open = open.slice(0, stale);
+    }
+    for (const m of EMPHASIS_MARKERS) {
+      if (keys.includes(m.key) && !open.includes(m.key)) {
+        result += m.marker;
+        open.push(m.key);
+      }
+    }
+    result += run.literal ? run.text : escapeMarkdownText(run.text);
+  }
+
+  for (let i = open.length - 1; i >= 0; i--) result += markerFor(open[i]);
+  return result;
+}
+
+// Assemble a GFM pipe table from already-escaped cell text.
+//
+// GFM has no colspan, and it sizes the whole table from the header row: a
+// merged first-row cell would otherwise define a one-column table and every
+// body column past the first would be dropped from the rendering. Rows are
+// padded to the widest row so no cell is lost.
+function renderPipeTable(rows: string[][]): string {
+  if (rows.length === 0) return '';
+  const width = Math.max(...rows.map(r => r.length));
+  const line = (cells: string[]) =>
+    `| ${Array.from({ length: width }, (_, i) => cells[i] ?? '').join(' | ')} |`;
+  const lines = [line(rows[0]), `| ${Array.from({ length: width }, () => '---').join(' | ')} |`];
+  for (const row of rows.slice(1)) lines.push(line(row));
+  return lines.join('\n');
+}
+
+// One entry per column the row occupies: a cell merged across N columns
+// contributes its text plus N-1 empty cells, keeping later rows aligned.
+function expandRowCells(row: any, renderCell: (cell: any) => string): string[] {
+  const cells: string[] = [];
+  for (const cell of row.tableCells || []) {
+    cells.push(renderCell(cell));
+    const span = cell.tableCellStyle?.columnSpan ?? 1;
+    for (let i = 1; i < span; i++) cells.push('');
+  }
+  return cells;
+}
+
+// A newline would terminate the table row, so multi-paragraph cell content is
+// joined with `<br>` rather than flattened into one run-on line. `|` has to be
+// escaped or it reads as a column separator.
+function escapeTableCell(text: string): string {
+  return text
+    .replace(/\|/g, '\\|')
+    .replace(/[ \t]*\n[ \t]*/g, '<br>')
+    .replace(/^(?:<br>)+|(?:<br>)+$/g, '')
+    .trim();
+}
+
+// Extract text from body content (paragraphs + tables). Inline images are
 // rendered from `inlineObjects` (markdown `![alt](uri)` or a single-line
 // placeholder) instead of being dropped.
+//
+// In markdown mode the document's structure is carried over too: heading
+// paragraphs get their ATX prefix, list paragraphs a `- `/`1. ` marker indented
+// by nesting level, styled runs their emphasis markers, and tables render as
+// pipe tables. Text mode is unchanged — plain runs, tab-separated table cells.
 function extractText(
   bodyContent: any[],
   inlineObjects?: any,
-  format: 'text' | 'markdown' = 'text'
+  format: 'text' | 'markdown' = 'text',
+  lists?: any
 ): string {
+  if (format === 'markdown') {
+    return extractMarkdown(bodyContent, inlineObjects, lists);
+  }
+
   const renderImage = (id: string): string =>
-    format === 'markdown'
-      ? renderImageMarkdown(getInlineImageMeta(id, inlineObjects))
-      : renderImagePlaceholder(getInlineImageMeta(id, inlineObjects));
+    renderImagePlaceholder(getInlineImageMeta(id, inlineObjects));
 
   let result = '';
   for (const element of bodyContent) {
@@ -213,6 +445,85 @@ function extractText(
   return result;
 }
 
+// Markdown rendering of body content, assembled as discrete blocks rather than
+// by string concatenation: markdown separates blocks with a blank line, and a
+// single newline between two paragraphs is only a soft break — the renderer
+// would merge them back into one paragraph and the document's most basic
+// structure would be lost. Consecutive list items stay one newline apart so a
+// list renders tight rather than as a series of loose paragraphs.
+function extractMarkdown(bodyContent: any[], inlineObjects?: any, lists?: any): string {
+  const listPrefix = createListPrefixer(lists);
+  const blocks: Array<{ text: string; list: boolean }> = [];
+
+  const paragraphRuns = (paragraph: any): MarkdownRun[] => {
+    const runs: MarkdownRun[] = [];
+    for (const elem of paragraph.elements || []) {
+      if (elem.textRun?.content) {
+        runs.push({ text: elem.textRun.content, keys: emphasisKeys(elem.textRun.textStyle) });
+      } else {
+        const inline = resolveInlineElementText(elem, inlineObjects, 'markdown');
+        if (inline) runs.push({ text: inline, keys: [], literal: true });
+      }
+    }
+    return runs;
+  };
+
+  // The paragraph's own trailing newline is dropped — block separation is the
+  // joiner's job below.
+  const paragraphBody = (paragraph: any): string =>
+    renderMarkdownRuns(paragraphRuns(paragraph)).replace(/\n+$/, '');
+
+  const renderCell = (cell: any): string => {
+    // A fresh prefixer per cell: list nesting inside a cell is independent of
+    // the surrounding document's lists.
+    const cellPrefix = createListPrefixer(lists);
+    const lines: string[] = [];
+    for (const cellContent of cell.content || []) {
+      if (!cellContent.paragraph?.elements) continue;
+      const body = paragraphBody(cellContent.paragraph);
+      if (body.trim() === '') continue;
+      lines.push((cellContent.paragraph.bullet ? cellPrefix(cellContent.paragraph) : '') + body);
+    }
+    return escapeTableCell(lines.join('\n'));
+  };
+
+  for (const element of bodyContent) {
+    if (element.paragraph?.elements) {
+      const body = paragraphBody(element.paragraph);
+      // Empty paragraphs carry no content and would only emit a bare `## ` or
+      // `- `; block separation already reproduces the vertical space.
+      if (body.trim() === '') continue;
+      const bullet = element.paragraph.bullet;
+      // A bulleted paragraph reads as a list item even when it also carries a
+      // heading style, so the list prefix wins.
+      const prefix = bullet
+        ? listPrefix(element.paragraph)
+        : markdownHeadingPrefix(element.paragraph);
+      blocks.push({ text: prefix + body, list: !!bullet });
+    } else if (element.table?.tableRows) {
+      const rows = element.table.tableRows.map((row: any) => expandRowCells(row, renderCell));
+      const table = renderPipeTable(rows);
+      if (table) blocks.push({ text: table, list: false });
+    }
+  }
+
+  let result = '';
+  blocks.forEach((block, i) => {
+    if (i > 0) result += block.list && blocks[i - 1].list ? '\n' : '\n\n';
+    result += block.text;
+  });
+  return result === '' ? '' : `${result}\n`;
+}
+
+// Prepend the document title as the markdown H1. A TITLE-styled paragraph in
+// the body renders as `# Title` in its own right, so when the two say the same
+// thing the prefix is dropped rather than giving the document two identical H1s.
+function withMarkdownTitle(title: string | null | undefined, body: string): string {
+  const heading = `# ${title}`;
+  if (body === heading || body.startsWith(`${heading}\n`)) return body;
+  return `${heading}\n\n${body}`;
+}
+
 // Extract full text from a Google Doc, handling tabs and optional tabId filtering
 function extractDocText(
   doc: any,
@@ -230,7 +541,7 @@ function extractDocText(
       }
       const bodyContent = tab.documentTab?.body?.content;
       if (bodyContent) {
-        text = extractText(bodyContent, tab.documentTab?.inlineObjects, format);
+        text = extractText(bodyContent, tab.documentTab?.inlineObjects, format, tab.documentTab?.lists);
       }
     } else {
       const allTabs = collectAllTabsWithLevel(tabs);
@@ -240,10 +551,12 @@ function extractDocText(
         if (isMultiTab) {
           const title = tab.tabProperties?.title || 'Untitled';
           const indent = '  '.repeat(level);
-          text += `${indent}=== Tab: ${title} ===\n`;
+          // The blank line keeps the header its own markdown block; without it
+          // the tab's first paragraph folds into the header line.
+          text += `${indent}=== Tab: ${title} ===\n${format === 'markdown' ? '\n' : ''}`;
         }
         if (bodyContent) {
-          text += extractText(bodyContent, tab.documentTab?.inlineObjects, format);
+          text += extractText(bodyContent, tab.documentTab?.inlineObjects, format, tab.documentTab?.lists);
         }
         if (isMultiTab) {
           text += '\n';
@@ -253,15 +566,38 @@ function extractDocText(
   } else {
     const body = doc.body;
     if (body?.content) {
-      text = extractText(body.content, doc.inlineObjects, format);
+      text = extractText(body.content, doc.inlineObjects, format, doc.lists);
     }
   }
 
   return { text };
 }
 
+// The Docs API `revisionId` is what `WriteControl.requiredRevisionId` expects.
+// It is a different identifier from the Drive `version` integer that
+// getDocumentInfo reports and from the Drive revision ids getRevisions lists;
+// neither of those is accepted as a lock, so the read tools have to surface the
+// Docs one explicitly. Docs populates it only for callers with edit access, so
+// a read-only caller is told why the lock is unavailable rather than silently
+// getting no value and no explanation.
+//
+// Two limits worth knowing, both from the Docs API reference: a revisionId is
+// only guaranteed valid for 24 hours, and it cannot be shared across users. The
+// second matters in this server's multi-account mode — a revisionId read under
+// one `manage_accounts` alias will not lock a write issued under another, so
+// read and write under the same account.
+const REVISION_UNAVAILABLE = 'unavailable (no edit access)';
+
+function revisionIdOf(doc: { revisionId?: string | null } | null | undefined): string {
+  return doc?.revisionId || REVISION_UNAVAILABLE;
+}
+
+function writeControlFor(ifRevisionId?: string): { writeControl?: { requiredRevisionId: string } } {
+  return ifRevisionId ? { writeControl: { requiredRevisionId: ifRevisionId } } : {};
+}
+
 // Execute batch update for Google Docs
-async function executeBatchUpdate(ctx: ToolContext, documentId: string, requests: any[]): Promise<any> {
+async function executeBatchUpdate(ctx: ToolContext, documentId: string, requests: any[], ifRevisionId?: string): Promise<any> {
   if (!requests || requests.length === 0) {
     return {};
   }
@@ -269,17 +605,63 @@ async function executeBatchUpdate(ctx: ToolContext, documentId: string, requests
   const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
   try {
-    const response = await docs.documents.batchUpdate({
-      documentId: documentId,
-      requestBody: { requests },
-    });
+    const response = await withRetry(
+      (signal) => docs.documents.batchUpdate({
+        documentId: documentId,
+        requestBody: { requests, ...writeControlFor(ifRevisionId) },
+      }, { signal }),
+      { ...ctx.runtimeConfig, retryMax: 0 },
+      'docs.documents.batchUpdate',
+      ctx.log
+    );
     return response.data;
   } catch (error: any) {
     ctx.log('Google Docs batchUpdate error:', error.message);
-    if (error.code === 404) throw new Error(`Document not found (ID: ${documentId})`);
-    if (error.code === 403) throw new Error(`Permission denied for document (ID: ${documentId})`);
+    // gaxios 7 only sets a numeric `code` for AIP-193-shaped errors; `status`
+    // is the reliable field. Keep `code` for gaxios-6-shaped callers/mocks.
+    if ((error.status ?? error.code) === 404) throw new Error(`Document not found (ID: ${documentId})`);
+    if ((error.status ?? error.code) === 403) throw new Error(`Permission denied for document (ID: ${documentId})`);
     throw new Error(`Google Docs API Error: ${error.message}`);
   }
+}
+
+// Resolve the body segments of an already-fetched document into distinct index
+// spaces. Every tab restarts indices at 1, so a caller that merges them gets
+// several paragraphs with identical ranges and no way to tell which one an
+// index-taking write should target. `label` is set only when the document has
+// more than one tab, so a single-tab document keeps reporting bare indices.
+//
+// Takes the document data rather than fetching: the indices a caller acts on
+// must come from the same read as the revisionId they lock against.
+function resolveBodySegments(
+  docData: any,
+  tabId?: string,
+): { segments: StyleSummarySegment[] } | { error: string } {
+  const tabs = docData?.tabs as any[] | undefined;
+
+  if (!tabs || tabs.length === 0) {
+    if (tabId) {
+      return { error: `Tab with ID "${tabId}" not found. Use listDocumentTabs to see available tabs.` };
+    }
+    return { segments: [{ content: docData?.body?.content }] };
+  }
+
+  if (tabId) {
+    const tab = findTabById(tabs, tabId);
+    if (!tab) {
+      return { error: `Tab with ID "${tabId}" not found. Use listDocumentTabs to see available tabs.` };
+    }
+    return { segments: [{ content: tab.documentTab?.body?.content }] };
+  }
+
+  const all = collectAllTabsWithLevel(tabs);
+  const isMultiTab = all.length > 1;
+  return {
+    segments: all.map(({ tab }) => ({
+      label: isMultiTab ? (tab.tabProperties?.title || 'Untitled') : undefined,
+      content: tab.documentTab?.body?.content,
+    })),
+  };
 }
 
 // Resolve a specific tab's body content array. A narrow `fields` projection
@@ -293,7 +675,12 @@ async function getTabBodyContent(
   tabId: string,
 ): Promise<{ content?: any[]; error?: string }> {
   const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-  const res = await docs.documents.get({ documentId, includeTabsContent: true });
+  const res = await withRetry(
+    (signal) => docs.documents.get({ documentId, includeTabsContent: true }, { signal }),
+    ctx.runtimeConfig,
+    'docs.documents.get(tabBody)',
+    ctx.log
+  );
   const tabs = (res.data as any).tabs as any[] | undefined;
   const tab = tabs ? findTabById(tabs, tabId) : null;
   if (!tab) {
@@ -313,7 +700,11 @@ function withTab<T extends object>(target: T, tabId?: string): T & { tabId?: str
 // Pass `preResolvedContent` to reuse an already-fetched body content array
 // (e.g. a tab body resolved once by the caller) and skip the internal GET —
 // see applyParagraphStyle's tab-scoped textToFind path (#114 follow-up).
-async function findTextRange(ctx: ToolContext, documentId: string, textToFind: string, instance: number = 1, tabId?: string, preResolvedContent?: any[]): Promise<{ startIndex: number; endIndex: number } | { error: string } | null> {
+// `segmentEndIndex` is the end index of the searched body/tab segment (the
+// index just past its final paragraph break). Callers that delete the match or
+// insert after it use it to stay inside the segment: Docs rejects deleting the
+// final newline and inserting at the segment end (#183 follow-up).
+async function findTextRange(ctx: ToolContext, documentId: string, textToFind: string, instance: number = 1, tabId?: string, preResolvedContent?: any[]): Promise<{ startIndex: number; endIndex: number; segmentEndIndex?: number } | { error: string } | null> {
   const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
   try {
@@ -325,10 +716,15 @@ async function findTextRange(ctx: ToolContext, documentId: string, textToFind: s
       if (resolved.error) return { error: resolved.error };
       content = resolved.content!;
     } else {
-      const res = await docs.documents.get({
-        documentId,
-        fields: 'body(content(paragraph(elements(startIndex,endIndex,textRun(content))),table,startIndex,endIndex))',
-      });
+      const res = await withRetry(
+        (signal) => docs.documents.get({
+          documentId,
+          fields: 'body(content(paragraph(elements(startIndex,endIndex,textRun(content))),table,startIndex,endIndex))',
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(findTextRange)',
+        ctx.log
+      );
       if (!res.data.body?.content) {
         return null;
       }
@@ -369,6 +765,14 @@ async function findTextRange(ctx: ToolContext, documentId: string, textToFind: s
     collectTextFromContent(content);
     segments.sort((a, b) => a.start - b.start);
 
+    // The segment end is the last structural element's endIndex. Fall back to
+    // the furthest text run when the structural index is absent (the body's
+    // closing paragraph always sorts last, after any tables).
+    const lastElement = content.length ? content[content.length - 1] : undefined;
+    const segmentEndIndex: number | undefined = typeof lastElement?.endIndex === 'number'
+      ? lastElement.endIndex
+      : (segments.length ? segments[segments.length - 1].end : undefined);
+
     // Find the specified instance
     let foundCount = 0;
     let searchStartIndex = 0;
@@ -403,7 +807,7 @@ async function findTextRange(ctx: ToolContext, documentId: string, textToFind: s
         }
 
         if (startIndex !== -1 && endIndex !== -1) {
-          return { startIndex, endIndex };
+          return segmentEndIndex !== undefined ? { startIndex, endIndex, segmentEndIndex } : { startIndex, endIndex };
         }
       }
 
@@ -413,7 +817,7 @@ async function findTextRange(ctx: ToolContext, documentId: string, textToFind: s
     return null;
   } catch (error: any) {
     ctx.log('Error finding text in document:', error.message);
-    if (error.code === 404) throw new Error(`Document not found (ID: ${documentId})`);
+    if ((error.status ?? error.code) === 404) throw new Error(`Document not found (ID: ${documentId})`);
     throw new Error(`Failed to search document: ${error.message}`);
   }
 }
@@ -433,10 +837,15 @@ async function getParagraphRange(ctx: ToolContext, documentId: string, indexWith
       if (resolved.error) return { error: resolved.error };
       content = resolved.content!;
     } else {
-      const res = await docs.documents.get({
-        documentId,
-        fields: 'body(content(startIndex,endIndex,paragraph,table))',
-      });
+      const res = await withRetry(
+        (signal) => docs.documents.get({
+          documentId,
+          fields: 'body(content(startIndex,endIndex,paragraph,table))',
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(paragraphRange)',
+        ctx.log
+      );
       if (!res.data.body?.content) {
         return null;
       }
@@ -543,18 +952,66 @@ function buildUpdateTextStyleRequest(
   };
 }
 
+// Paragraph border edges as exposed on applyParagraphStyle. "between" is the
+// rule Docs draws between consecutive paragraphs that share identical border
+// settings.
+const PARAGRAPH_BORDER_EDGES = ['top', 'bottom', 'left', 'right', 'between'] as const;
+type ParagraphBorderEdge = (typeof PARAGRAPH_BORDER_EDGES)[number];
+
+export interface ParagraphBorderInput {
+  color?: string;
+  width?: number;
+  padding?: number;
+  dashStyle?: 'SOLID' | 'DOT' | 'DASH';
+}
+
+const PARAGRAPH_BORDER_KEYS = {
+  top: 'borderTop',
+  bottom: 'borderBottom',
+  left: 'borderLeft',
+  right: 'borderRight',
+  between: 'borderBetween',
+} as const satisfies Record<ParagraphBorderEdge, string>;
+
+// Compile a border param into the API's ParagraphBorder. The API refuses a
+// partially-specified border ("Unsupported dimension unit: UNIT_UNSPECIFIED"
+// when padding is omitted), so every subfield gets a default: black, 1pt
+// wide, 1pt padding, SOLID.
+function buildParagraphBorder(input: ParagraphBorderInput): any {
+  const rgbColor = hexToRgbColor(input.color ?? '#000000');
+  if (!rgbColor) throw new Error(`Invalid border hex color: ${input.color}`);
+  return {
+    color: { color: { rgbColor } },
+    width: { magnitude: input.width ?? 1, unit: 'PT' },
+    padding: { magnitude: input.padding ?? 1, unit: 'PT' },
+    dashStyle: input.dashStyle ?? 'SOLID',
+  };
+}
+
 // Pure helper – build paragraph style update request
-function buildUpdateParagraphStyleRequest(
+export function buildUpdateParagraphStyleRequest(
   startIndex: number,
   endIndex: number,
   style: {
     alignment?: 'START' | 'END' | 'CENTER' | 'JUSTIFIED';
     indentStart?: number;
     indentEnd?: number;
+    indentFirstLine?: number;
     spaceAbove?: number;
     spaceBelow?: number;
     namedStyleType?: string;
     keepWithNext?: boolean;
+    keepLinesTogether?: boolean;
+    avoidWidowAndOrphan?: boolean;
+    pageBreakBefore?: boolean;
+    borderTop?: ParagraphBorderInput;
+    borderBottom?: ParagraphBorderInput;
+    borderLeft?: ParagraphBorderInput;
+    borderRight?: ParagraphBorderInput;
+    borderBetween?: ParagraphBorderInput;
+    removeBorders?: Array<ParagraphBorderEdge | 'all'>;
+    shading?: string;
+    removeShading?: boolean;
   },
   tabId?: string
 ): { request: any; fields: string[] } | null {
@@ -564,10 +1021,42 @@ function buildUpdateParagraphStyleRequest(
   if (style.alignment !== undefined) { paragraphStyle.alignment = style.alignment; fieldsToUpdate.push('alignment'); }
   if (style.indentStart !== undefined) { paragraphStyle.indentStart = { magnitude: style.indentStart, unit: 'PT' }; fieldsToUpdate.push('indentStart'); }
   if (style.indentEnd !== undefined) { paragraphStyle.indentEnd = { magnitude: style.indentEnd, unit: 'PT' }; fieldsToUpdate.push('indentEnd'); }
+  if (style.indentFirstLine !== undefined) { paragraphStyle.indentFirstLine = { magnitude: style.indentFirstLine, unit: 'PT' }; fieldsToUpdate.push('indentFirstLine'); }
   if (style.spaceAbove !== undefined) { paragraphStyle.spaceAbove = { magnitude: style.spaceAbove, unit: 'PT' }; fieldsToUpdate.push('spaceAbove'); }
   if (style.spaceBelow !== undefined) { paragraphStyle.spaceBelow = { magnitude: style.spaceBelow, unit: 'PT' }; fieldsToUpdate.push('spaceBelow'); }
   if (style.namedStyleType !== undefined) { paragraphStyle.namedStyleType = style.namedStyleType; fieldsToUpdate.push('namedStyleType'); }
   if (style.keepWithNext !== undefined) { paragraphStyle.keepWithNext = style.keepWithNext; fieldsToUpdate.push('keepWithNext'); }
+  if (style.keepLinesTogether !== undefined) { paragraphStyle.keepLinesTogether = style.keepLinesTogether; fieldsToUpdate.push('keepLinesTogether'); }
+  if (style.avoidWidowAndOrphan !== undefined) { paragraphStyle.avoidWidowAndOrphan = style.avoidWidowAndOrphan; fieldsToUpdate.push('avoidWidowAndOrphan'); }
+  if (style.pageBreakBefore !== undefined) { paragraphStyle.pageBreakBefore = style.pageBreakBefore; fieldsToUpdate.push('pageBreakBefore'); }
+
+  // Removal rides the API's FieldMask reset semantics: naming a border field in
+  // `fields` while leaving it unset in paragraphStyle clears the paragraph-level
+  // border, so the paragraph falls back to whatever its named style defines.
+  const removals = new Set<ParagraphBorderEdge>(
+    (style.removeBorders ?? []).flatMap((edge) => (edge === 'all' ? PARAGRAPH_BORDER_EDGES : [edge]))
+  );
+  for (const edge of PARAGRAPH_BORDER_EDGES) {
+    const field = PARAGRAPH_BORDER_KEYS[edge];
+    const input = style[field];
+    if (removals.has(edge)) {
+      if (input !== undefined) throw new Error(`Cannot both set and remove the ${edge} border in one call`);
+      fieldsToUpdate.push(field);
+    } else if (input !== undefined) {
+      paragraphStyle[field] = buildParagraphBorder(input);
+      fieldsToUpdate.push(field);
+    }
+  }
+
+  if (style.removeShading) {
+    if (style.shading !== undefined) throw new Error('Cannot both set and remove shading in one call');
+    fieldsToUpdate.push('shading');
+  } else if (style.shading !== undefined) {
+    const rgbColor = hexToRgbColor(style.shading);
+    if (!rgbColor) throw new Error(`Invalid shading hex color: ${style.shading}`);
+    paragraphStyle.shading = { backgroundColor: { color: { rgbColor } } };
+    fieldsToUpdate.push('shading');
+  }
 
   if (fieldsToUpdate.length === 0) return null;
 
@@ -581,6 +1070,180 @@ function buildUpdateParagraphStyleRequest(
     },
     fields: fieldsToUpdate
   };
+}
+
+// ---------------------------------------------------------------------------
+// styleDocTable – compile table styling params into updateTableCellStyle /
+// updateTableColumnProperties / updateTableRowStyle requests (one atomic batch)
+// ---------------------------------------------------------------------------
+
+function borderFieldName(edge: string): string {
+  return `border${edge.charAt(0).toUpperCase()}${edge.slice(1)}`;
+}
+
+const TABLE_BORDER_EDGES = ['top', 'bottom', 'left', 'right'] as const;
+type TableBorderEdge = (typeof TABLE_BORDER_EDGES)[number];
+
+export interface TableCellBorderInput {
+  color?: string;
+  width?: number;
+  dashStyle?: 'SOLID' | 'DOT' | 'DASH';
+}
+
+function buildTableCellBorder(input: TableCellBorderInput): any {
+  const rgbColor = hexToRgbColor(input.color ?? '#000000');
+  if (!rgbColor) throw new Error(`Invalid border hex color: ${input.color}`);
+  return {
+    color: { color: { rgbColor } },
+    width: { magnitude: input.width ?? 1, unit: 'PT' },
+    dashStyle: input.dashStyle ?? 'SOLID',
+  };
+}
+
+export interface StyleDocTableArgs {
+  tableStartIndex: number;
+  tabId?: string;
+  rowIndex?: number;
+  columnIndex?: number;
+  rowSpan?: number;
+  columnSpan?: number;
+  backgroundColor?: string;
+  removeBackground?: boolean;
+  contentAlignment?: 'TOP' | 'MIDDLE' | 'BOTTOM';
+  padding?: number;
+  borderTop?: TableCellBorderInput;
+  borderBottom?: TableCellBorderInput;
+  borderLeft?: TableCellBorderInput;
+  borderRight?: TableCellBorderInput;
+  removeBorders?: Array<TableBorderEdge | 'all'>;
+  columnIndices?: number[];
+  columnWidth?: number;
+  rowIndices?: number[];
+  minRowHeight?: number;
+}
+
+export function buildStyleDocTableRequests(a: StyleDocTableArgs): { requests: any[]; applied: string[] } {
+  const requests: any[] = [];
+  const applied: string[] = [];
+  const tableStartLocation = withTab({ index: a.tableStartIndex }, a.tabId);
+
+  // Cell targeting scopes the cell-style request only. updateTableColumnProperties
+  // and updateTableRowStyle address the table through columnIndices/rowIndices,
+  // so a caller who passes rowIndex/columnIndex alongside columnWidth would get
+  // the cell style scoped to one cell and the width applied to every column —
+  // not what "this cell" reads as. Refuse rather than silently widen.
+  const cellTargeted = a.rowIndex !== undefined || a.columnIndex !== undefined
+    || a.rowSpan !== undefined || a.columnSpan !== undefined;
+  if (cellTargeted && (a.columnWidth !== undefined || a.minRowHeight !== undefined)) {
+    throw new Error('rowIndex/columnIndex/rowSpan/columnSpan scope cell styles only — columnWidth and minRowHeight always apply at table scope, so issue them in a separate call (scoped with columnIndices/rowIndices)');
+  }
+
+  // ---- updateTableCellStyle -----------------------------------------------
+  const tableCellStyle: any = {};
+  const cellFields: string[] = [];
+
+  if (a.removeBackground) {
+    if (a.backgroundColor !== undefined) throw new Error('Cannot both set and remove backgroundColor in one call');
+    cellFields.push('backgroundColor');
+    applied.push('background cleared');
+  } else if (a.backgroundColor !== undefined) {
+    const rgbColor = hexToRgbColor(a.backgroundColor);
+    if (!rgbColor) throw new Error(`Invalid background hex color: ${a.backgroundColor}`);
+    tableCellStyle.backgroundColor = { color: { rgbColor } };
+    cellFields.push('backgroundColor');
+    applied.push(`background ${a.backgroundColor}`);
+  }
+
+  if (a.contentAlignment !== undefined) {
+    tableCellStyle.contentAlignment = a.contentAlignment;
+    cellFields.push('contentAlignment');
+    applied.push(`contentAlignment ${a.contentAlignment}`);
+  }
+
+  if (a.padding !== undefined) {
+    for (const edge of ['paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight']) {
+      tableCellStyle[edge] = { magnitude: a.padding, unit: 'PT' };
+      cellFields.push(edge);
+    }
+    applied.push(`padding ${a.padding}pt`);
+  }
+
+  // Unlike paragraph borders, a cleared table border is expressed as an
+  // explicit width-0 border (the Docs UI's "0 pt" unbox), not a FieldMask
+  // reset — cells always carry a border object.
+  const removals = new Set<TableBorderEdge>(
+    (a.removeBorders ?? []).flatMap((edge) => (edge === 'all' ? TABLE_BORDER_EDGES : [edge]))
+  );
+  for (const edge of TABLE_BORDER_EDGES) {
+    const field = borderFieldName(edge);
+    const input = a[field as 'borderTop'];
+    if (removals.has(edge)) {
+      if (input !== undefined) throw new Error(`Cannot both set and remove the ${edge} border in one call`);
+      tableCellStyle[field] = buildTableCellBorder({ width: 0 });
+      cellFields.push(field);
+    } else if (input !== undefined) {
+      tableCellStyle[field] = buildTableCellBorder(input);
+      cellFields.push(field);
+    }
+  }
+  if (removals.size > 0) applied.push(`borders cleared (${[...removals].join(', ')})`);
+  const setEdges = TABLE_BORDER_EDGES.filter((e) => a[borderFieldName(e) as 'borderTop'] !== undefined);
+  if (setEdges.length > 0) applied.push(`borders set (${setEdges.join(', ')})`);
+
+  if (cellFields.length > 0) {
+    const isSubset = cellTargeted;
+    if (isSubset && (a.rowIndex === undefined || a.columnIndex === undefined)) {
+      throw new Error('Cell subset targeting needs both rowIndex and columnIndex (spans optional)');
+    }
+    const target = isSubset
+      ? {
+          tableRange: {
+            tableCellLocation: { tableStartLocation, rowIndex: a.rowIndex, columnIndex: a.columnIndex },
+            rowSpan: a.rowSpan ?? 1,
+            columnSpan: a.columnSpan ?? 1,
+          },
+        }
+      : { tableStartLocation };
+    requests.push({
+      updateTableCellStyle: { ...target, tableCellStyle, fields: cellFields.join(',') },
+    });
+  } else if (cellTargeted) {
+    // Cell targeting with no cell style to apply: nothing would be sent.
+    throw new Error('rowIndex/columnIndex/rowSpan/columnSpan target cell styles only — pass a cell style param, or use columnIndices/rowIndices for column and row updates');
+  }
+
+  // ---- updateTableColumnProperties ----------------------------------------
+  if (a.columnWidth !== undefined) {
+    if (a.columnWidth < 5) throw new Error('columnWidth must be at least 5 points');
+    requests.push({
+      updateTableColumnProperties: {
+        tableStartLocation,
+        columnIndices: a.columnIndices ?? [],
+        tableColumnProperties: { widthType: 'FIXED_WIDTH', width: { magnitude: a.columnWidth, unit: 'PT' } },
+        fields: 'width,widthType',
+      },
+    });
+    applied.push(`column width ${a.columnWidth}pt (${a.columnIndices?.length ? `columns ${a.columnIndices.join(', ')}` : 'all columns'})`);
+  } else if (a.columnIndices !== undefined) {
+    throw new Error('columnIndices given without columnWidth');
+  }
+
+  // ---- updateTableRowStyle ------------------------------------------------
+  if (a.minRowHeight !== undefined) {
+    requests.push({
+      updateTableRowStyle: {
+        tableStartLocation,
+        rowIndices: a.rowIndices ?? [],
+        tableRowStyle: { minRowHeight: { magnitude: a.minRowHeight, unit: 'PT' } },
+        fields: 'minRowHeight',
+      },
+    });
+    applied.push(`min row height ${a.minRowHeight}pt (${a.rowIndices?.length ? `rows ${a.rowIndices.join(', ')}` : 'all rows'})`);
+  } else if (a.rowIndices !== undefined) {
+    throw new Error('rowIndices given without minRowHeight');
+  }
+
+  return { requests, applied };
 }
 
 // Insert an inline image from a URL
@@ -746,7 +1409,7 @@ export interface DocxContextResult {
  * Build formatted content with indices from a Google Doc document data object.
  * Returns the formatted string and total character length.
  */
-function buildDocFormattedContent(
+export function buildDocFormattedContent(
   docData: any,
   withFormatting: boolean
 ): { formattedContent: string; totalLength: number } {
@@ -758,6 +1421,21 @@ function buildDocFormattedContent(
     // rules) whose rendered text length is unrelated to their real doc span, so
     // the displayed edit range must use [startIndex, endIndex), not text length.
     atomic?: boolean;
+    // True for multi-line renderings (tables) whose text is a *rendering*, not
+    // index-mapped content: emit one real [startIndex-endIndex) span for the
+    // whole element and never derive per-line ranges from rendered lengths.
+    // The old arithmetic started at the table's own real start index and ran
+    // FORWARD past its end into whatever followed, so a table's ranges
+    // collided with the content after it (sometimes a later table); they never
+    // reached backward into an earlier one.
+    spanOnly?: boolean;
+    // Real per-cell index ranges, carried alongside the rendering so text
+    // inside a cell is still addressable by applyTextStyle/formatGoogleDocText.
+    // editTableCell only styles a whole cell.
+    cellSpans?: Array<{ row: number; column: number; startIndex: number; endIndex: number }>;
+    // Paragraph-level style annotation: a one-line rendering of the
+    // paragraph's non-default styles over its real span; carries no content.
+    paraMeta?: boolean;
     fontFamily?: string;
     fontSize?: number;
     bold?: boolean;
@@ -766,49 +1444,54 @@ function buildDocFormattedContent(
     strikethrough?: boolean;
     foregroundColor?: string;
     backgroundColor?: string;
-  }
-
-  function resolveInlineElementText(el: any, inlineObjects?: any): string | null {
-    if (el.person?.personProperties) {
-      const p = el.person.personProperties;
-      if (p.name && p.email) return `@${p.name} (${p.email})`;
-      return `@${p.name || p.email || ''}`;
-    }
-    if (el.richLink?.richLinkProperties) {
-      const rl = el.richLink.richLinkProperties;
-      const title = escapeBrackets(rl.title || rl.uri || '');
-      const uri = rl.uri;
-      return title && uri ? `[${title}](${uri})` : title || null;
-    }
-    if (el.inlineObjectElement?.inlineObjectId) {
-      return renderImagePlaceholder(getInlineImageMeta(el.inlineObjectElement.inlineObjectId, inlineObjects));
-    }
-    if (el.footnoteReference) {
-      return `[^${el.footnoteReference.footnoteNumber || ''}]`;
-    }
-    if (el.horizontalRule) {
-      return '---\n';
-    }
-    return null;
+    // Only set for SUPERSCRIPT/SUBSCRIPT. The API reports NONE for ordinary
+    // text, which carries no information and would force a meta line onto
+    // every unformatted run.
+    baselineOffset?: 'SUPERSCRIPT' | 'SUBSCRIPT';
   }
 
   function extractSegments(bodyContent: any[], inlineObjects?: any): Segment[] {
     const segments: Segment[] = [];
 
-    function getCellText(cellContent: any[]): string {
+    function getCellText(cellContent: any[]): { text: string; startIndex?: number; endIndex?: number } {
       const before = segments.length;
       processContent(cellContent);
       const cellSegs = segments.splice(before);
-      return cellSegs
+      // Paragraph meta is a one-line annotation over a paragraph's span, not
+      // content. Joined into a cell it would render inside the pipe row as
+      // `| ¶ center Header A |` — a regression in the formatted read itself.
+      // Filtered from the joined text only; the spans still feed the cell range.
+      const text = cellSegs
+        .filter(c => !c.paraMeta)
         .map(s => s.text.replace(/\n$/g, ''))
         .join(' ')
         .replace(/\|/g, '\\|')
         .trim();
+      // The spliced segments carry the cell's true indices from the API. They
+      // used to be discarded, which left text inside a table with no range at
+      // all once the fabricated per-row ranges were removed.
+      if (cellSegs.length === 0) return { text };
+      return {
+        text,
+        startIndex: Math.min(...cellSegs.map(c => c.startIndex)),
+        endIndex: Math.max(...cellSegs.map(c => c.endIndex)),
+      };
     }
 
     function processContent(content: any[]) {
       for (const element of content) {
         if (element.paragraph?.elements) {
+          if (withFormatting && element.startIndex != null && element.endIndex != null) {
+            const bits = paragraphMetaBits(element.paragraph);
+            if (bits.length) {
+              segments.push({
+                text: `\u00b6 ${bits.join(', ')}`,
+                startIndex: element.startIndex,
+                endIndex: element.endIndex,
+                paraMeta: true,
+              });
+            }
+          }
           for (const textElement of element.paragraph.elements) {
             if (textElement.textRun?.content && textElement.startIndex != null && textElement.endIndex != null) {
               const seg: Segment = {
@@ -829,6 +1512,9 @@ function buildDocFormattedContent(
                   const bg = rgbColorToHex(ts.backgroundColor);
                   if (fg) seg.foregroundColor = fg;
                   if (bg) seg.backgroundColor = bg;
+                  if (ts.baselineOffset === 'SUPERSCRIPT' || ts.baselineOffset === 'SUBSCRIPT') {
+                    seg.baselineOffset = ts.baselineOffset;
+                  }
                 }
               }
               segments.push(seg);
@@ -845,25 +1531,30 @@ function buildDocFormattedContent(
             }
           }
         } else if (element.table?.tableRows) {
-          const rows: string[] = [];
-          for (let rowIdx = 0; rowIdx < element.table.tableRows.length; rowIdx++) {
-            const row = element.table.tableRows[rowIdx];
+          const rows: string[][] = [];
+          const cellSpans: Array<{ row: number; column: number; startIndex: number; endIndex: number }> = [];
+          let rowIndex = 0;
+          for (const row of element.table.tableRows) {
             if (!row.tableCells) continue;
-            const cellTexts: string[] = [];
-            for (const cell of row.tableCells) {
-              cellTexts.push(cell.content ? getCellText(cell.content) : '');
-            }
-            rows.push('| ' + cellTexts.join(' | ') + ' |');
-            if (rowIdx === 0) {
-              rows.push('| ' + cellTexts.map(() => '---').join(' | ') + ' |');
-            }
+            let columnIndex = 0;
+            rows.push(expandRowCells(row, (cell: any) => {
+              const got = cell.content ? getCellText(cell.content) : { text: '' };
+              if (got.startIndex != null && got.endIndex != null) {
+                cellSpans.push({ row: rowIndex, column: columnIndex, startIndex: got.startIndex, endIndex: got.endIndex });
+              }
+              columnIndex++;
+              return got.text;
+            }));
+            rowIndex++;
           }
-          const md = rows.join('\n') + '\n\n';
+          const md = renderPipeTable(rows) + '\n\n';
           if (element.startIndex != null && element.endIndex != null) {
             segments.push({
               text: md,
               startIndex: element.startIndex,
               endIndex: element.endIndex,
+              spanOnly: true,
+              ...(cellSpans.length ? { cellSpans } : {}),
             });
           }
         } else if (element.tableOfContents?.content) {
@@ -876,11 +1567,22 @@ function buildDocFormattedContent(
     return segments;
   }
 
-  function formatSegments(segments: Segment[]): string {
+  function formatSegments(segments: Segment[], tabId?: string): string {
+    // A table hint that names only tableStartIndex is wrong on a multi-tab
+    // document: index spaces restart per tab, so two tabs can each hold a
+    // table starting at the same index, and editTableCell without a tabId
+    // only searches the first tab. Name the tab too — and the header below
+    // prints the id so the caller can actually supply it.
+    const tabIdHint = tabId ? `, tabId=${tabId}` : '';
     let result = '';
     for (const segment of segments) {
       const hasMeta = withFormatting && hasFormattingInfo(segment);
       const meta = hasMeta ? buildMetaLine(segment) : null;
+      // Paragraph style annotations: one line over the paragraph's real span.
+      if (segment.paraMeta) {
+        result += `[${segment.startIndex}-${segment.endIndex}] ${segment.text}\n`;
+        continue;
+      }
       // Atomic inline replacements occupy exactly [startIndex, endIndex) in the
       // doc regardless of how long their placeholder text is. Emit that real
       // range on one line so index-based edits target the object, not the text
@@ -891,6 +1593,25 @@ function buildDocFormattedContent(
           result += meta
             ? `[${segment.startIndex}-${segment.endIndex}] ${meta}\n  ${line}\n`
             : `[${segment.startIndex}-${segment.endIndex}] ${line}\n`;
+        }
+        continue;
+      }
+      // Tables: the markdown below is a rendering, not index-mapped content —
+      // one real span for the element, no fabricated per-row ranges. Cell
+      // indices live in documents.get; targeting a cell needs the table's real
+      // startIndex (this one) with editTableCell's row/column addressing.
+      if (segment.spanOnly) {
+        const body = segment.text.replace(/\n+$/, '');
+        if (body.trim()) {
+          result += `[${segment.startIndex}-${segment.endIndex}] <table — span is the real index range; rows below are a rendering, use editTableCell (tableStartIndex=${segment.startIndex}${tabIdHint}) for cell edits>\n${body}\n`;
+          // Real per-cell ranges, so text inside a cell can still be targeted
+          // by the range-taking tools. editTableCell styles a whole cell.
+          if (segment.cellSpans?.length) {
+            const map = segment.cellSpans
+              .map(c => `r${c.row}c${c.column} [${c.startIndex}-${c.endIndex}]`)
+              .join(', ');
+            result += `cells: ${map}\n`;
+          }
         }
         continue;
       }
@@ -911,7 +1632,7 @@ function buildDocFormattedContent(
   }
 
   function hasFormattingInfo(seg: Segment): boolean {
-    return !!(seg.fontFamily || seg.fontSize || seg.bold || seg.italic || seg.underline || seg.strikethrough || seg.foregroundColor || seg.backgroundColor);
+    return !!(seg.fontFamily || seg.fontSize || seg.bold || seg.italic || seg.underline || seg.strikethrough || seg.foregroundColor || seg.backgroundColor || seg.baselineOffset);
   }
 
   function buildMetaLine(seg: Segment): string {
@@ -924,6 +1645,7 @@ function buildDocFormattedContent(
     if (seg.underline) styles.push('underline');
     if (seg.strikethrough) styles.push('strikethrough');
     if (styles.length > 0) parts.push(`style=${styles.join(',')}`);
+    if (seg.baselineOffset) parts.push(`baseline=${seg.baselineOffset.toLowerCase()}`);
     if (seg.foregroundColor) parts.push(`color=${seg.foregroundColor}`);
     if (seg.backgroundColor) parts.push(`bg=${seg.backgroundColor}`);
     return parts.join(', ');
@@ -963,13 +1685,14 @@ function buildDocFormattedContent(
       if (isMultiTab) {
         const title = tab.tabProperties?.title || 'Untitled';
         const indent = '  '.repeat(level);
-        formattedContent += `${indent}=== Tab: ${title} ===\n`;
+        const tabId = tab.tabProperties?.tabId;
+        formattedContent += `${indent}=== Tab: ${title}${tabId ? ` (tabId=${tabId})` : ''} ===\n`;
       }
       if (bodyContent) {
         const tabInlineObjects = tab.documentTab?.inlineObjects;
         const segments = extractSegments(bodyContent, tabInlineObjects);
         trackFonts(segments);
-        formattedContent += formatSegments(segments);
+        formattedContent += formatSegments(segments, tab.tabProperties?.tabId);
         if (segments.length > 0) {
           totalLength += segments[segments.length - 1].endIndex;
         }
@@ -1013,6 +1736,64 @@ function sliceByLine(content: string, offset: number, limit: number): { slice: s
     if (nl > offset) end = nl + 1;
   }
   return { slice: content.slice(offset, end), end };
+}
+
+// Line-boundary slicing is enough for text output, where every line stands on
+// its own, but a markdown table spans several lines that only render together:
+// cut between them and the first page ends in a headerless fragment while the
+// next begins with orphaned `| a | b |` rows. Snap the cut back to the start of
+// the table instead — including the `[a-b] <table ...>` header the indexed reads
+// print above it, which would otherwise be stranded at the bottom of the
+// previous page. A table longer than `limit` keeps the hard cut so pagination
+// still makes forward progress, but even then the cut never falls between the
+// header and its first row.
+function sliceMarkdownByBlock(content: string, offset: number, limit: number): { slice: string; end: number } {
+  const { end } = sliceByLine(content, offset, limit);
+  if (end >= content.length) return { slice: content.slice(offset, end), end };
+
+  // Lines that only make sense next to their table: the pipe rows themselves,
+  // and the per-cell index map the indexed reads print underneath them.
+  const isTableBodyLine = (lineStart: number) =>
+    content.startsWith('|', lineStart) || /^cells: r\d+c\d+ \[/.test(content.slice(lineStart, lineStart + 24));
+  // The indexed reads prefix a table with a header line naming its real span.
+  // Walking back over body lines alone would strand that header at the bottom
+  // of the previous page, which is the thing being prevented.
+  const isTableHeaderLine = (lineStart: number) =>
+    /^\[\d+-\d+\] <table/.test(content.slice(lineStart, lineStart + 40));
+  const lineStartBefore = (pos: number) => {
+    const prevBreak = content.lastIndexOf('\n', pos - 2);
+    return prevBreak === -1 ? 0 : prevBreak + 1;
+  };
+
+  // `end` sits at the start of the next page's first line.
+  if (!isTableBodyLine(end)) return { slice: content.slice(offset, end), end };
+
+  let tableStart = end;
+  while (tableStart > offset) {
+    const lineStart = lineStartBefore(tableStart);
+    if (lineStart < offset || !isTableBodyLine(lineStart)) break;
+    tableStart = lineStart;
+  }
+  // Take the header with the rows it describes.
+  const headerStart = lineStartBefore(tableStart);
+  if (tableStart > offset && headerStart >= offset && isTableHeaderLine(headerStart)) {
+    tableStart = headerStart;
+  }
+  // The table starts at or before this page's own start, so it cannot be moved
+  // wholly onto the next page — the block is longer than `limit`. Keep the hard
+  // cut so pagination still advances, but never cut directly after the header:
+  // that is the split that opens the next page with bare `| a | b |` rows and
+  // nothing naming the table. Carry the first body line across with it.
+  if (tableStart <= offset) {
+    const lastLineStart = lineStartBefore(end);
+    if (isTableHeaderLine(lastLineStart)) {
+      const nextBreak = content.indexOf('\n', end);
+      const extended = nextBreak === -1 ? content.length : nextBreak + 1;
+      return { slice: content.slice(offset, extended), end: extended };
+    }
+    return { slice: content.slice(offset, end), end };
+  }
+  return { slice: content.slice(offset, tableStart), end: tableStart };
 }
 
 /**
@@ -1245,7 +2026,8 @@ const CreateDocFromHTMLSchema = z.object({
 const UpdateGoogleDocSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
   content: z.string(),
-  tabId: z.string().optional()
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
 });
 
 const GetGoogleDocContentSchema = z.object({
@@ -1263,16 +2045,34 @@ const InsertTextSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
   text: z.string().min(1, "Text to insert is required"),
   // Google Docs use 1-based indexes; text files use 0-based offsets — accept both, validate at runtime.
-  index: z.number().int().min(0, "Index must be non-negative"),
-  tabId: z.string().optional()
+  index: z.number().int().min(0, "Index must be non-negative").optional(),
+  textToFind: z.string().min(1).optional(),
+  matchInstance: z.number().int().min(1).optional().default(1),
+  position: z.enum(['before', 'after']).optional().default('after'),
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
+}).refine(data => (data.index !== undefined) !== (data.textToFind !== undefined), {
+  message: "Provide exactly one of index or textToFind"
 });
 
 const DeleteRangeSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
-  startIndex: z.number().int().min(0, "Start index must be non-negative"),
-  endIndex: z.number().int().min(0, "End index must be non-negative"),
-  tabId: z.string().optional()
-}).refine(data => data.endIndex > data.startIndex, {
+  startIndex: z.number().int().min(0, "Start index must be non-negative").optional(),
+  endIndex: z.number().int().min(0, "End index must be non-negative").optional(),
+  textToFind: z.string().min(1).optional(),
+  matchInstance: z.number().int().min(1).optional().default(1),
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
+}).refine(data => {
+  // Exactly one targeting mode: both indices and no textToFind, or textToFind
+  // and no index at all. A stray single index next to textToFind is refused
+  // rather than silently ignored (#183 follow-up).
+  const anyIndex = data.startIndex !== undefined || data.endIndex !== undefined;
+  const bothIndices = data.startIndex !== undefined && data.endIndex !== undefined;
+  return data.textToFind !== undefined ? !anyIndex : bothIndices;
+}, {
+  message: "Provide either startIndex+endIndex or textToFind, not both"
+}).refine(data => data.startIndex === undefined || data.endIndex === undefined || data.endIndex > data.startIndex, {
   message: "End index must be greater than start index",
   path: ["endIndex"]
 });
@@ -1320,7 +2120,15 @@ const ApplyTextStyleSchema = z.object({
   backgroundColor: z.string().optional(),
   linkUrl: z.string().url().optional(),
   baselineOffset: z.enum(['SUPERSCRIPT', 'SUBSCRIPT', 'NONE']).optional(),
-  tabId: z.string().optional()
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
+});
+
+const ParagraphBorderParamSchema = z.object({
+  color: z.string().optional(),
+  width: z.number().min(0).optional(),
+  padding: z.number().min(0).optional(),
+  dashStyle: z.enum(['SOLID', 'DOT', 'DASH']).optional(),
 });
 
 const ApplyParagraphStyleSchema = z.object({
@@ -1333,11 +2141,24 @@ const ApplyParagraphStyleSchema = z.object({
   alignment: z.enum(['START', 'END', 'CENTER', 'JUSTIFIED']).optional(),
   indentStart: z.number().min(0).optional(),
   indentEnd: z.number().min(0).optional(),
+  indentFirstLine: z.number().min(0).optional(),
   spaceAbove: z.number().min(0).optional(),
   spaceBelow: z.number().min(0).optional(),
   namedStyleType: z.enum(['NORMAL_TEXT', 'TITLE', 'SUBTITLE', 'HEADING_1', 'HEADING_2', 'HEADING_3', 'HEADING_4', 'HEADING_5', 'HEADING_6']).optional(),
   keepWithNext: z.boolean().optional(),
-  tabId: z.string().optional()
+  keepLinesTogether: z.boolean().optional(),
+  avoidWidowAndOrphan: z.boolean().optional(),
+  pageBreakBefore: z.boolean().optional(),
+  borderTop: ParagraphBorderParamSchema.optional(),
+  borderBottom: ParagraphBorderParamSchema.optional(),
+  borderLeft: ParagraphBorderParamSchema.optional(),
+  borderRight: ParagraphBorderParamSchema.optional(),
+  borderBetween: ParagraphBorderParamSchema.optional(),
+  removeBorders: z.array(z.enum(['top', 'bottom', 'left', 'right', 'between', 'all'])).optional(),
+  shading: z.string().optional(),
+  removeShading: z.boolean().optional(),
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
 });
 
 const CreateParagraphBulletsSchema = z.object({
@@ -1362,7 +2183,8 @@ const CreateParagraphBulletsSchema = z.object({
     'NUMBERED_ZERODECIMAL_ALPHA_ROMAN',
     'NONE'
   ]).default('BULLET_DISC_CIRCLE_SQUARE'),
-  tabId: z.string().optional()
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
 });
 
 const ListCommentsSchema = z.object({
@@ -1379,10 +2201,16 @@ const GetCommentSchema = z.object({
 
 const AddCommentSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
-  startIndex: z.number().int().min(1, "Start index must be at least 1"),
-  endIndex: z.number().int().min(1, "End index must be at least 1"),
+  startIndex: z.number().int().min(1, "Start index must be at least 1").optional(),
+  endIndex: z.number().int().min(1, "End index must be at least 1").optional(),
+  textToFind: z.string().min(1).optional(),
+  matchInstance: z.number().int().min(1).default(1),
+  tabId: z.string().optional(),
   commentText: z.string().min(1, "Comment text is required")
-});
+}).refine(
+  (d) => (d.startIndex != null && d.endIndex != null) || d.textToFind != null,
+  { message: "Provide either startIndex+endIndex or textToFind" },
+);
 
 const ReplyToCommentSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
@@ -1401,7 +2229,8 @@ const InsertTableSchema = z.object({
   rows: z.number().int().min(1, "Must have at least 1 row"),
   columns: z.number().int().min(1, "Must have at least 1 column"),
   index: z.number().int().min(1, "Index must be at least 1 (1-based)"),
-  tabId: z.string().optional()
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
 });
 
 const EditTableCellSchema = z.object({
@@ -1414,7 +2243,38 @@ const EditTableCellSchema = z.object({
   italic: z.boolean().optional(),
   fontSize: z.number().optional(),
   alignment: z.enum(["START", "CENTER", "END", "JUSTIFIED"]).optional(),
-  tabId: z.string().optional()
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional()
+});
+
+const TableCellBorderParamSchema = z.object({
+  color: z.string().optional(),
+  width: z.number().min(0).optional(),
+  dashStyle: z.enum(['SOLID', 'DOT', 'DASH']).optional(),
+});
+
+const StyleDocTableSchema = z.object({
+  documentId: z.string().min(1, "Document ID is required"),
+  tableStartIndex: z.number().int().min(1, "Table start index is required"),
+  rowIndex: z.number().int().min(0).optional(),
+  columnIndex: z.number().int().min(0).optional(),
+  rowSpan: z.number().int().min(1).optional(),
+  columnSpan: z.number().int().min(1).optional(),
+  backgroundColor: z.string().optional(),
+  removeBackground: z.boolean().optional(),
+  contentAlignment: z.enum(['TOP', 'MIDDLE', 'BOTTOM']).optional(),
+  padding: z.number().min(0).optional(),
+  borderTop: TableCellBorderParamSchema.optional(),
+  borderBottom: TableCellBorderParamSchema.optional(),
+  borderLeft: TableCellBorderParamSchema.optional(),
+  borderRight: TableCellBorderParamSchema.optional(),
+  removeBorders: z.array(z.enum(['top', 'bottom', 'left', 'right', 'all'])).optional(),
+  columnIndices: z.array(z.number().int().min(0)).optional(),
+  columnWidth: z.number().optional(),
+  rowIndices: z.array(z.number().int().min(0)).optional(),
+  minRowHeight: z.number().min(0).optional(),
+  tabId: z.string().optional(),
+  ifRevisionId: z.string().optional(),
 });
 
 const InsertImageFromUrlSchema = z.object({
@@ -1438,11 +2298,34 @@ const InsertLocalImageSchema = z.object({
 const ListGoogleDocsSchema = z.object({
   maxResults: z.number().int().min(1).max(100).optional().default(20).describe("Maximum number of documents to return (1-100)."),
   query: z.string().optional().describe("Search query to filter documents by name or content."),
-  orderBy: z.enum(["name", "modifiedTime", "createdTime"]).optional().default("modifiedTime").describe("Sort order for results.")
+  orderBy: z.enum(DRIVE_ORDER_BY_VALUES).optional().default("modifiedTime desc").describe("Sort order for results.")
 });
 
 const GetDocumentInfoSchema = z.object({
   documentId: z.string().min(1, "Document ID is required")
+});
+
+const GetGoogleDocStyleSummarySchema = z.object({
+  documentId: z.string().min(1, "Document ID is required"),
+  tabId: z.string().optional(),
+});
+
+const DescribeGoogleDocRangeSchema = z.object({
+  documentId: z.string().min(1, "Document ID is required"),
+  startIndex: z.number().int().min(1).optional(),
+  endIndex: z.number().int().min(1).optional(),
+  textToFind: z.string().min(1).optional(),
+  matchInstance: z.number().int().min(1).optional().default(1),
+  tabId: z.string().optional(),
+}).refine((d) => d.startIndex != null || d.textToFind != null, {
+  message: "Provide startIndex (optionally endIndex) or textToFind",
+}).refine((d) => !(d.textToFind != null && (d.startIndex != null || d.endIndex != null)), {
+  // insertText and deleteRange refuse mixed targeting rather than silently
+  // preferring one mode (#183); a silently ignored endIndex reads as a probe
+  // of a range the caller never got.
+  message: "Provide either startIndex/endIndex or textToFind, not both",
+}).refine((d) => !(d.startIndex != null && d.endIndex != null && d.endIndex <= d.startIndex), {
+  message: "endIndex must be greater than startIndex",
 });
 
 const FindAndReplaceInDocSchema = z.object({
@@ -1452,6 +2335,8 @@ const FindAndReplaceInDocSchema = z.object({
   matchCase: z.boolean().optional().default(false),
   dryRun: z.boolean().optional().default(false),
   tabId: z.string().optional(),
+  expectedCount: z.number().int().min(1).optional(),
+  ifRevisionId: z.string().optional(),
 });
 
 const AddDocumentTabSchema = z.object({
@@ -1471,6 +2356,7 @@ const InsertSmartChipSchema = z.object({
   chipType: z.enum(["person"]),
   personEmail: z.string().email("Valid email is required for person chip"),
   tabId: z.string().optional(),
+  ifRevisionId: z.string().optional(),
 });
 
 const ReadSmartChipsSchema = z.object({
@@ -1483,6 +2369,7 @@ const CreateFootnoteSchema = z.object({
   endOfSegment: z.boolean().optional(),
   content: z.string().optional(),
   tabId: z.string().optional(),
+  ifRevisionId: z.string().optional(),
 }).refine(data => data.index !== undefined || data.endOfSegment === true, {
   message: "Either 'index' or 'endOfSegment: true' must be provided",
 });
@@ -1490,6 +2377,68 @@ const CreateFootnoteSchema = z.object({
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
+
+// Shared by applyParagraphStyle and its formatGoogleDocParagraph alias so the
+// two schemas cannot drift.
+function paragraphBorderProperty(edgeDescription: string) {
+  return {
+    type: "object",
+    description: `${edgeDescription} Omitted subfields default to a rendering border: color #000000, width 1pt, padding 1pt, SOLID.`,
+    properties: {
+      color: { type: "string", description: "Hex color (e.g., #FF0000; default #000000)" },
+      width: { type: "number", description: "Line width in points (default: 1)" },
+      padding: { type: "number", description: "Space between the border and the paragraph text, in points (default: 1)" },
+      dashStyle: { type: "string", enum: ["SOLID", "DOT", "DASH"], description: "Line style (default: SOLID)" }
+    }
+  };
+}
+
+// Table cell borders have no per-border padding (cell padding is separate).
+function tableCellBorderProperty(edgeDescription: string) {
+  return {
+    type: "object",
+    description: `${edgeDescription} Omitted subfields default to a rendering border: color #000000, width 1pt, SOLID.`,
+    properties: {
+      color: { type: "string", description: "Hex color (e.g., #FF0000; default #000000)" },
+      width: { type: "number", description: "Line width in points (default: 1; 0 = invisible)" },
+      dashStyle: { type: "string", enum: ["SOLID", "DOT", "DASH"], description: "Line style (default: SOLID)" }
+    }
+  };
+}
+
+const applyParagraphStyleInputSchema = {
+  type: "object",
+  properties: {
+    documentId: { type: "string", description: "The document ID" },
+    startIndex: { type: "number", description: "Start index (1-based) - use with endIndex" },
+    endIndex: { type: "number", description: "End index (exclusive) - use with startIndex" },
+    textToFind: { type: "string", description: "Text within the target paragraph" },
+    matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
+    indexWithinParagraph: { type: "number", description: "Any index within the target paragraph" },
+    alignment: { type: "string", enum: ["START", "END", "CENTER", "JUSTIFIED"], description: "Text alignment" },
+    indentStart: { type: "number", description: "Left indent in points" },
+    indentEnd: { type: "number", description: "Right indent in points" },
+    indentFirstLine: { type: "number", description: "First-line indent in points" },
+    spaceAbove: { type: "number", description: "Space above in points" },
+    spaceBelow: { type: "number", description: "Space below in points" },
+    namedStyleType: { type: "string", enum: ["NORMAL_TEXT", "TITLE", "SUBTITLE", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"], description: "Named paragraph style" },
+    keepWithNext: { type: "boolean", description: "Keep with next paragraph" },
+    keepLinesTogether: { type: "boolean", description: "Keep all lines of the paragraph on one page" },
+    avoidWidowAndOrphan: { type: "boolean", description: "Avoid widow and orphan lines" },
+    pageBreakBefore: { type: "boolean", description: "Start the paragraph on a new page" },
+    borderTop: paragraphBorderProperty("Border above the paragraph."),
+    borderBottom: paragraphBorderProperty("Border below the paragraph (a horizontal rule)."),
+    borderLeft: paragraphBorderProperty("Border left of the paragraph."),
+    borderRight: paragraphBorderProperty("Border right of the paragraph."),
+    borderBetween: paragraphBorderProperty("Border between consecutive same-styled paragraphs."),
+    removeBorders: { type: "array", items: { type: "string", enum: ["top", "bottom", "left", "right", "between", "all"] }, description: "Border edges to clear at the paragraph level, so each falls back to the border its named style defines (usually none). Does not touch horizontalRule elements. The update applies to EVERY paragraph overlapping the target range, so removeBorders: [\"all\"] over the whole body strips every paragraph border in one call." },
+    shading: { type: "string", description: "Paragraph background color as hex (e.g., #F1F3F4)" },
+    removeShading: { type: "boolean", description: "Clear the paragraph background shading" },
+    tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." },
+    ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
+  },
+  required: ["documentId"]
+};
 
 export const toolDefinitions: ToolDefinition[] = [
   {
@@ -1520,13 +2469,14 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "updateGoogleDoc",
-    description: "Update an existing Google Doc (replaces all content). For multi-tab docs, specify tabId to replace a single tab's content atomically; leaves other tabs untouched.",
+    description: "Update an existing Google Doc (replaces all content). The replacement is one atomic batchUpdate, so a failure leaves the document unchanged rather than wiped. For multi-tab docs, specify tabId to replace a single tab's content; leaves other tabs untouched.",
     inputSchema: {
       type: "object",
       properties: {
         documentId: { type: "string", description: "Doc ID" },
         content: { type: "string", description: "New content" },
-        tabId: { type: "string", description: "Optional. Tab ID to replace (from listDocumentTabs). If set, delete+insert run in a single atomic batchUpdate scoped to that tab." }
+        tabId: { type: "string", description: "Optional. Tab ID to replace (from listDocumentTabs). If set, delete+insert run in a single atomic batchUpdate scoped to that tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId", "content"]
     }
@@ -1539,10 +2489,14 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         documentId: { type: "string", description: "The Google Doc or text file ID" },
         text: { type: "string", description: "Text to insert" },
-        index: { type: "number", description: "Position to insert at. Google Docs: 1-based Docs API structural index. Text files: 0-based Unicode code point (character) offset." },
-        tabId: { type: "string", description: "Optional. Google Docs only — Tab ID to insert into (from listDocumentTabs). If omitted, inserts into the first/default tab. Not supported on text files." }
+        index: { type: "number", description: "Position to insert at. Google Docs: 1-based Docs API structural index. Text files: 0-based Unicode code point (character) offset. Provide exactly one of index or textToFind." },
+        textToFind: { type: "string", description: "Google Docs only: locate the insertion point by text instead of index (exact, case-sensitive match). Combine with position (before/after) and matchInstance. If the match ends at the document's final paragraph break, 'after' inserts just before that break." },
+        matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
+        position: { type: "string", enum: ["before", "after"], description: "Insert before or after the matched text (default: after). Only used with textToFind." },
+        tabId: { type: "string", description: "Optional. Google Docs only — Tab ID to insert into (from listDocumentTabs). If omitted, inserts into the first/default tab. Not supported on text files." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
-      required: ["documentId", "text", "index"]
+      required: ["documentId", "text"]
     }
   },
   {
@@ -1552,16 +2506,19 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         documentId: { type: "string", description: "The Google Doc or text file ID" },
-        startIndex: { type: "number", description: "Start index (inclusive). Google Docs: 1-based Docs API structural index. Text files: 0-based Unicode code point (character) offset." },
+        startIndex: { type: "number", description: "Start index (inclusive). Google Docs: 1-based Docs API structural index. Text files: 0-based Unicode code point (character) offset. Provide startIndex+endIndex or textToFind." },
         endIndex: { type: "number", description: "End index (exclusive). Google Docs: 1-based Docs API structural index. Text files: 0-based Unicode code point (character) offset." },
-        tabId: { type: "string", description: "Optional. Google Docs only — Tab ID to delete from (from listDocumentTabs). If omitted, deletes from the first/default tab. Not supported on text files." }
+        textToFind: { type: "string", description: "Google Docs only: delete the matched text instead of an index range (exact, case-sensitive match). Combine with matchInstance. A match that ends with the document's final paragraph break is trimmed to keep that break, since Docs does not allow deleting it." },
+        matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
+        tabId: { type: "string", description: "Optional. Google Docs only — Tab ID to delete from (from listDocumentTabs). If omitted, deletes from the first/default tab. Not supported on text files." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
-      required: ["documentId", "startIndex", "endIndex"]
+      required: ["documentId"]
     }
   },
   {
     name: "readGoogleDoc",
-    description: "Read content of a Google Doc with format options. Supports multi-tab documents.",
+    description: "Read content of a Google Doc with format options. Supports multi-tab documents. Text/markdown output leads with the document's revisionId — pass it as ifRevisionId on write tools for an optimistic lock.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1621,38 +2578,20 @@ export const toolDefinitions: ToolDefinition[] = [
         backgroundColor: { type: "string", description: "Hex background color" },
         linkUrl: { type: "string", description: "URL for hyperlink" },
         baselineOffset: { type: "string", enum: ["SUPERSCRIPT", "SUBSCRIPT", "NONE"], description: "Vertical text offset: SUPERSCRIPT or SUBSCRIPT. Use NONE to reset text to the normal baseline." },
-        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." }
+        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId"]
     }
   },
   {
     name: "applyParagraphStyle",
-    description: "Apply paragraph formatting. Use EITHER startIndex+endIndex OR textToFind OR indexWithinParagraph for targeting.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "The document ID" },
-        startIndex: { type: "number", description: "Start index (1-based) - use with endIndex" },
-        endIndex: { type: "number", description: "End index (exclusive) - use with startIndex" },
-        textToFind: { type: "string", description: "Text within the target paragraph" },
-        matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
-        indexWithinParagraph: { type: "number", description: "Any index within the target paragraph" },
-        alignment: { type: "string", enum: ["START", "END", "CENTER", "JUSTIFIED"], description: "Text alignment" },
-        indentStart: { type: "number", description: "Left indent in points" },
-        indentEnd: { type: "number", description: "Right indent in points" },
-        spaceAbove: { type: "number", description: "Space above in points" },
-        spaceBelow: { type: "number", description: "Space below in points" },
-        namedStyleType: { type: "string", enum: ["NORMAL_TEXT", "TITLE", "SUBTITLE", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"], description: "Named paragraph style" },
-        keepWithNext: { type: "boolean", description: "Keep with next paragraph" },
-        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." }
-      },
-      required: ["documentId"]
-    }
+    description: "Apply paragraph formatting — alignment, indents, spacing, named styles, borders (top/bottom/left/right/between), shading, and pagination controls. Use EITHER startIndex+endIndex OR textToFind OR indexWithinParagraph for targeting. The update styles EVERY paragraph overlapping the range, so one call over the whole body with removeBorders: [\"all\"] strips every paragraph border from a document.",
+    inputSchema: applyParagraphStyleInputSchema
   },
   {
     name: "formatGoogleDocText",
-    description: "Apply text formatting (bold, italic, font, color, links) to a range or found text in a Google Doc. Alias for applyTextStyle.",
+    description: "Apply text formatting (bold, italic, font, color, links, superscript/subscript) to a range or found text in a Google Doc. Alias for applyTextStyle.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1670,34 +2609,17 @@ export const toolDefinitions: ToolDefinition[] = [
         foregroundColor: { type: "string", description: "Hex color (e.g., #FF0000)" },
         backgroundColor: { type: "string", description: "Hex background color" },
         linkUrl: { type: "string", description: "URL for hyperlink" },
-        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." }
+        baselineOffset: { type: "string", enum: ["SUPERSCRIPT", "SUBSCRIPT", "NONE"], description: "Vertical text offset: SUPERSCRIPT or SUBSCRIPT. Use NONE to reset text to the normal baseline." },
+        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId"]
     }
   },
   {
     name: "formatGoogleDocParagraph",
-    description: "Apply paragraph formatting (alignment, indentation, spacing, heading style) in a Google Doc. Alias for applyParagraphStyle.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "The document ID" },
-        startIndex: { type: "number", description: "Start index (1-based) - use with endIndex" },
-        endIndex: { type: "number", description: "End index (exclusive) - use with startIndex" },
-        textToFind: { type: "string", description: "Text within the target paragraph" },
-        matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
-        indexWithinParagraph: { type: "number", description: "Any index within the target paragraph" },
-        alignment: { type: "string", enum: ["START", "END", "CENTER", "JUSTIFIED"], description: "Text alignment" },
-        indentStart: { type: "number", description: "Left indent in points" },
-        indentEnd: { type: "number", description: "Right indent in points" },
-        spaceAbove: { type: "number", description: "Space above in points" },
-        spaceBelow: { type: "number", description: "Space below in points" },
-        namedStyleType: { type: "string", enum: ["NORMAL_TEXT", "TITLE", "SUBTITLE", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"], description: "Named paragraph style" },
-        keepWithNext: { type: "boolean", description: "Keep with next paragraph" },
-        tabId: { type: "string", description: "Optional. Tab ID to format within (from listDocumentTabs). If omitted, operates on the first/default tab." }
-      },
-      required: ["documentId"]
-    }
+    description: "Apply paragraph formatting (alignment, indentation, spacing, heading style, borders, shading) in a Google Doc. Alias for applyParagraphStyle.",
+    inputSchema: applyParagraphStyleInputSchema
   },
   {
     name: "createParagraphBullets",
@@ -1711,6 +2633,7 @@ export const toolDefinitions: ToolDefinition[] = [
         textToFind: { type: "string", description: "Text within the target paragraph(s) to bulletize" },
         matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
         bulletPreset: { type: "string", enum: ["BULLET_DISC_CIRCLE_SQUARE", "BULLET_DIAMONDX_ARROW3D_SQUARE", "BULLET_CHECKBOX", "BULLET_ARROW_DIAMOND_DISC", "BULLET_STAR_CIRCLE_SQUARE", "BULLET_ARROW3D_CIRCLE_SQUARE", "BULLET_LEFTTRIANGLE_DIAMOND_DISC", "NUMBERED_DECIMAL_ALPHA_ROMAN", "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS", "NUMBERED_DECIMAL_NESTED", "NUMBERED_UPPERALPHA_ALPHA_ROMAN", "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL", "NUMBERED_ZERODECIMAL_ALPHA_ROMAN", "NONE"], description: "Bullet style preset. Use NONE to remove bullets. Default: BULLET_DISC_CIRCLE_SQUARE" },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." },
         tabId: { type: "string", description: "Optional. Tab ID to operate within (from listDocumentTabs). If omitted, operates on the first/default tab." }
       },
       required: ["documentId"]
@@ -1718,7 +2641,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "findAndReplaceInDoc",
-    description: "Find and replace text across a Google Document. Dry-run mode counts matches from paragraph text only (may differ from actual replacements which cover tables, headers, footers, etc.). For multi-tab docs, specify tabId to scope replacements to a single tab.",
+    description: "Find and replace text across a Google Document. Dry-run mode counts matches exactly across body, tables, headers, footers, and footnotes. On zero matches the response explains the likeliest lookalike cause (non-breaking spaces, curly quotes, HTML entities, case). For multi-tab docs, specify tabId to scope replacements to a single tab. When replaceText contains a newline, the write is always locked to the revision its matches were located in — even without an explicit ifRevisionId — since the compiled batch targets indices from that read; a concurrent edit fails the call instead of landing at the wrong offsets.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1726,8 +2649,10 @@ export const toolDefinitions: ToolDefinition[] = [
         findText: { type: "string", description: "Text to find" },
         replaceText: { type: "string", description: "Replacement text" },
         matchCase: { type: "boolean", description: "Case-sensitive match (default: false)" },
-        dryRun: { type: "boolean", description: "Only count approximate matches from paragraph text, do not modify document (default: false). Ignores tabId — always scans the full document body." },
-        tabId: { type: "string", description: "Optional. Tab ID to scope replacements to (from listDocumentTabs). If omitted, replaces across all tabs." }
+        dryRun: { type: "boolean", description: "Only count matches, do not modify the document (default: false). Respects tabId scoping." },
+        tabId: { type: "string", description: "Optional. Tab ID to scope replacements to (from listDocumentTabs). If omitted, replaces across all tabs." },
+        expectedCount: { type: "number", description: "Optional safety guard: the exact number of occurrences you expect to replace. Counted before writing; on a mismatch the call aborts without modifying the document (catches substring collisions and stale assumptions). Costs one extra document read per call, and a zero-match result costs one more to diagnose the likeliest cause — this tool is no longer a single API request when the guard is set." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId", "findText", "replaceText"]
     }
@@ -1760,16 +2685,19 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "addComment",
-    description: "Add a comment anchored to a specific text range. Note: Due to Google API limitations, programmatic comments appear in 'All Comments' but may not be visibly anchored in the document UI.",
+    description: "Add a comment quoting a text range, targeted by startIndex+endIndex or by textToFind. The comment appears in the document's comment panel and records the quoted passage. Google Docs does not support margin-anchored comments through any public API, so the comment is unanchored by design; this is a platform limit, not a failure.",
     inputSchema: {
       type: "object",
       properties: {
         documentId: { type: "string", description: "The document ID" },
-        startIndex: { type: "number", description: "Start index (1-based)" },
-        endIndex: { type: "number", description: "End index (exclusive)" },
+        startIndex: { type: "number", description: "Start index (1-based; or use textToFind)" },
+        endIndex: { type: "number", description: "End index (exclusive; or use textToFind)" },
+        textToFind: { type: "string", description: "Quote this exact text instead of using indices (case-sensitive)" },
+        matchInstance: { type: "number", description: "Which occurrence of textToFind to quote (1-based, default 1)" },
+        tabId: { type: "string", description: "Tab ID for multi-tab documents (defaults to the document body)" },
         commentText: { type: "string", description: "The comment content" }
       },
-      required: ["documentId", "startIndex", "endIndex", "commentText"]
+      required: ["documentId", "commentText"]
     }
   },
   {
@@ -1805,7 +2733,7 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         documentId: { type: "string", description: "Document ID" },
-        includeFormatting: { type: "boolean", description: "Include font, style, and color info for each text span (default: false)" },
+        includeFormatting: { type: "boolean", description: "Include font, style, color, and baseline info for each text span, plus one ¶ line per paragraph with non-default paragraph styles (named style, alignment, visible borders, shading) over its real index span (default: false)" },
       },
       required: ["documentId"]
     }
@@ -1817,7 +2745,7 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         documentId: { type: "string", description: "Document ID" },
-        includeFormatting: { type: "boolean", description: "Include font, style, and color info for each text span (default: false)" },
+        includeFormatting: { type: "boolean", description: "Include font, style, color, and baseline info for each text span, plus one ¶ line per paragraph with non-default paragraph styles (named style, alignment, visible borders, shading) over its real index span (default: false)" },
         offset: { type: "number", description: "Character offset into the formatted indexed output (not raw doc characters). 0-based, default: 0. Pass the previous response's nextOffset to get the following page." },
         limit: { type: "number", description: "Maximum characters to return per page (default: 50000, max: 80000; kept below the host's ~100K output cap to leave room for the JSON envelope and newline escaping). The page end is snapped back to a line boundary where possible; a single line longer than limit is hard-cut to guarantee forward progress." }
       },
@@ -1847,7 +2775,8 @@ export const toolDefinitions: ToolDefinition[] = [
         rows: { type: "number", description: "Number of rows for the new table" },
         columns: { type: "number", description: "Number of columns for the new table" },
         index: { type: "number", description: "The index (1-based) where the table should be inserted" },
-        tabId: { type: "string", description: "Optional. Tab ID to insert the table into (from listDocumentTabs). If omitted, inserts into the first/default tab." }
+        tabId: { type: "string", description: "Optional. Tab ID to insert the table into (from listDocumentTabs). If omitted, inserts into the first/default tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId", "rows", "columns", "index"]
     }
@@ -1867,9 +2796,41 @@ export const toolDefinitions: ToolDefinition[] = [
         italic: { type: "boolean", description: "Make text italic" },
         fontSize: { type: "number", description: "Font size in points" },
         alignment: { type: "string", enum: ["START", "CENTER", "END", "JUSTIFIED"], description: "Text alignment" },
-        tabId: { type: "string", description: "Optional. Tab ID containing the table (from listDocumentTabs). If omitted, operates on the first/default tab." }
+        tabId: { type: "string", description: "Optional. Tab ID containing the table (from listDocumentTabs). If omitted, operates on the first/default tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
       },
       required: ["documentId", "tableStartIndex", "rowIndex", "columnIndex"]
+    }
+  },
+  {
+    name: "styleDocTable",
+    description: "Style a Docs table in one atomic call: cell borders/background/padding/content alignment (whole table via tableStartLocation, or a cell range subset), fixed column widths, and minimum row heights. Get the real tableStartIndex from the table span line readGoogleDoc or getGoogleDocContent prints (tableStartIndex=N) — never compute it from text offsets. removeBorders: [\"all\"] unboxes the table (width-0 borders). The API resolves shared edges by applying border updates right-to-left then bottom-to-top.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", description: "The document ID" },
+        tableStartIndex: { type: "number", description: "Start index of the TABLE element, as printed by readGoogleDoc / getGoogleDocContent on the table's span line (tableStartIndex=N)" },
+        rowIndex: { type: "number", description: "Optional cell-subset targeting: first row (0-based); needs columnIndex too" },
+        columnIndex: { type: "number", description: "Optional cell-subset targeting: first column (0-based); needs rowIndex too" },
+        rowSpan: { type: "number", description: "Rows in the targeted cell range (default: 1)" },
+        columnSpan: { type: "number", description: "Columns in the targeted cell range (default: 1)" },
+        backgroundColor: { type: "string", description: "Cell background color as hex (e.g., #F1F3F4)" },
+        removeBackground: { type: "boolean", description: "Clear the cell background color" },
+        contentAlignment: { type: "string", enum: ["TOP", "MIDDLE", "BOTTOM"], description: "Vertical content alignment within cells" },
+        padding: { type: "number", description: "Cell padding on all four edges, in points" },
+        borderTop: tableCellBorderProperty("Cell top border."),
+        borderBottom: tableCellBorderProperty("Cell bottom border."),
+        borderLeft: tableCellBorderProperty("Cell left border."),
+        borderRight: tableCellBorderProperty("Cell right border."),
+        removeBorders: { type: "array", items: { type: "string", enum: ["top", "bottom", "left", "right", "all"] }, description: "Border edges to clear via width-0 borders. [\"all\"] over the whole table = unbox it in one call" },
+        columnIndices: { type: "array", items: { type: "number" }, description: "Columns (0-based) for columnWidth; omit for all columns" },
+        columnWidth: { type: "number", description: "Fixed column width in points (minimum 5)" },
+        rowIndices: { type: "array", items: { type: "number" }, description: "Rows (0-based) for minRowHeight; omit for all rows" },
+        minRowHeight: { type: "number", description: "Minimum row height in points" },
+        tabId: { type: "string", description: "Optional. Tab ID containing the table (from listDocumentTabs). If omitted, operates on the first/default tab." },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." }
+      },
+      required: ["documentId", "tableStartIndex"]
     }
   },
   {
@@ -1912,7 +2873,7 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         maxResults: { type: "integer", description: "Maximum number of documents to return (1-100)." },
         query: { type: "string", description: "Search query to filter documents by name or content." },
-        orderBy: { type: "string", enum: ["name", "modifiedTime", "createdTime"], description: "Sort order for results." }
+        orderBy: { type: "string", enum: [...DRIVE_ORDER_BY_VALUES], description: "Sort order for results. Keys without 'desc' sort ascending, so 'modifiedTime' is oldest-first.", default: "modifiedTime desc" }
       },
       required: []
     }
@@ -1924,6 +2885,34 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         documentId: { type: "string", description: "The ID of the Google Document (from the URL)." }
+      },
+      required: ["documentId"]
+    }
+  },
+  {
+    name: "getGoogleDocStyleSummary",
+    description: "Compact style inventory of a whole document in a few hundred tokens: fonts with their size ladders, named-style counts, text colors, bordered and shaded paragraph locations, a table inventory with real index ranges, and the heading outline. The cheap first read before any formatting work, in place of pulling the full document JSON to answer style questions. Counts cover every tab; locations are prefixed with the tab title on a multi-tab document, since index spaces restart per tab. Reports the document's revisionId, so the same read that gives you the indices gives you the lock to pass as ifRevisionId on the write.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", description: "The document ID" },
+        tabId: { type: "string", description: "Optional. Summarize only this tab (from listDocumentTabs). If omitted, covers every tab." }
+      },
+      required: ["documentId"]
+    }
+  },
+  {
+    name: "describeGoogleDocRange",
+    description: "Style probe for one spot: the paragraph styles (named style, alignment, borders, shading, indents, spacing, bullets) and text runs (font, size, bold/italic/underline, colors, links) overlapping a range, with the real document index of every paragraph and run so the result feeds straight into applyParagraphStyle or applyTextStyle. Target it with startIndex (optionally endIndex) or with textToFind, not both. Describes one tab's body; headers, footers, and footnotes are separate index spaces and are not included. Reports the document's revisionId, so the same read that gives you the indices gives you the lock to pass as ifRevisionId on the write.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", description: "The document ID" },
+        startIndex: { type: "number", description: "Start index (1-based). Use this or textToFind." },
+        endIndex: { type: "number", description: "End index (exclusive). Defaults to startIndex + 1. Only with startIndex." },
+        textToFind: { type: "string", description: "Describe the styling at this exact text (case-sensitive). Use this or startIndex." },
+        matchInstance: { type: "number", description: "Which occurrence of textToFind (1-based, default 1)" },
+        tabId: { type: "string", description: "Optional. Tab to probe (from listDocumentTabs). If omitted, uses the first/default tab." }
       },
       required: ["documentId"]
     }
@@ -1963,6 +2952,7 @@ export const toolDefinitions: ToolDefinition[] = [
         index: { type: "number", description: "Insertion index (1-based)" },
         chipType: { type: "string", enum: ["person"], description: "Smart chip type (only 'person' is supported)" },
         personEmail: { type: "string", description: "Email address for the person mention" },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." },
         tabId: { type: "string", description: "Optional. Tab ID to insert into (from listDocumentTabs). If omitted, inserts into the first/default tab." }
       },
       required: ["documentId", "index", "chipType", "personEmail"]
@@ -1989,6 +2979,7 @@ export const toolDefinitions: ToolDefinition[] = [
         index: { type: "number", description: "1-based character index where the footnote reference should be inserted" },
         endOfSegment: { type: "boolean", description: "If true, insert footnote at the end of the document body (use instead of index)" },
         content: { type: "string", description: "Optional text content for the footnote body" },
+        ifRevisionId: { type: "string", description: "Optional optimistic lock: a revisionId from readGoogleDoc, getGoogleDocContent, getGoogleDocContentPaginated, or getDocumentInfo. The write fails cleanly if the document changed since that read. Valid for 24 hours, and only for the account that read it. Google Docs only." },
         tabId: { type: "string", description: "Optional. Tab ID to insert the footnote into (from listDocumentTabs). If omitted, inserts into the first/default tab." },
       },
       required: ["documentId"]
@@ -2028,15 +3019,20 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       // Create empty doc
       let docResponse;
       try {
-        docResponse = await ctx.getDrive().files.create({
-          requestBody: {
-            name: a.name,
-            mimeType: 'application/vnd.google-apps.document',
-            parents: [parentFolderId]
-          },
-          fields: 'id, name, webViewLink',
-          supportsAllDrives: true
-        });
+        docResponse = await withRetry(
+          (signal) => ctx.getDrive().files.create({
+            requestBody: {
+              name: a.name,
+              mimeType: 'application/vnd.google-apps.document',
+              parents: [parentFolderId]
+            },
+            fields: 'id, name, webViewLink',
+            supportsAllDrives: true
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'drive.files.create(googleDoc)',
+          ctx.log
+        );
       } catch (createError: any) {
         ctx.log('Drive files.create error details:', {
           message: createError.message,
@@ -2127,19 +3123,24 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       let fileResponse;
       try {
-        fileResponse = await ctx.getDrive().files.create({
-          requestBody: {
-            name: a.name,
-            mimeType: 'application/vnd.google-apps.document',
-            parents: [parentFolderId]
-          },
-          media: {
-            mimeType: 'text/html',
-            body: Readable.from(htmlBuffer)
-          },
-          fields: 'id, name, webViewLink',
-          supportsAllDrives: true
-        });
+        fileResponse = await withRetry(
+          (signal) => ctx.getDrive().files.create({
+            requestBody: {
+              name: a.name,
+              mimeType: 'application/vnd.google-apps.document',
+              parents: [parentFolderId]
+            },
+            media: {
+              mimeType: 'text/html',
+              body: Readable.from(htmlBuffer)
+            },
+            fields: 'id, name, webViewLink',
+            supportsAllDrives: true
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+          'drive.files.create(docFromHtml)',
+          ctx.log
+        );
       } catch (createError: any) {
         ctx.log('Drive files.create (HTML) error details:', {
           message: createError.message,
@@ -2168,7 +3169,12 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       if (a.tabId) {
         // Tab-scoped path: single atomic batchUpdate so a failed insert can't leave the tab wiped.
-        const document = await docs.documents.get({ documentId: a.documentId, includeTabsContent: true });
+        const document = await withRetry(
+          (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(updateGoogleDoc.tab)',
+          ctx.log
+        );
         const tabs = (document.data as any).tabs as any[] | undefined;
         const tab = tabs ? findTabById(tabs, a.tabId) : null;
         if (!tab) {
@@ -2198,10 +3204,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
           }
         });
 
-        await docs.documents.batchUpdate({
-          documentId: a.documentId,
-          requestBody: { requests }
-        });
+        await withRetry(
+          (signal) => docs.documents.batchUpdate({
+            documentId: a.documentId,
+            requestBody: { requests, ...writeControlFor(a.ifRevisionId) }
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'docs.documents.batchUpdate(updateGoogleDoc.tab)',
+          ctx.log
+        );
 
         return {
           content: [{ type: "text", text: `Updated Google Doc: ${document.data.title} (tab: ${a.tabId})` }],
@@ -2209,48 +3220,50 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         };
       }
 
-      const document = await docs.documents.get({ documentId: a.documentId });
+      const document = await withRetry(
+        (signal) => docs.documents.get({ documentId: a.documentId }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(updateGoogleDoc)',
+        ctx.log
+      );
 
       // Delete all content
       const endIndex = document.data.body?.content?.[document.data.body.content.length - 1]?.endIndex || 1;
       const deleteEndIndex = Math.max(1, endIndex - 1);
 
+      // One atomic batchUpdate, same as the tabId path above. Splitting the
+      // delete from the insert meant a failed insert left the document wiped,
+      // and it left the lock covering only the first of the two calls — on an
+      // empty document the delete is skipped entirely, so ifRevisionId guarded
+      // nothing at all.
+      const requests: any[] = [];
       if (deleteEndIndex > 1) {
-        await docs.documents.batchUpdate({
-          documentId: a.documentId,
-          requestBody: {
-            requests: [{
-              deleteContentRange: {
-                range: { startIndex: 1, endIndex: deleteEndIndex }
-              }
-            }]
+        requests.push({
+          deleteContentRange: {
+            range: { startIndex: 1, endIndex: deleteEndIndex }
           }
         });
       }
-
-      // Insert new content
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [
-            {
-              insertText: { location: { index: 1 }, text: a.content }
-            },
-            {
-              updateParagraphStyle: {
-                range: {
-                  startIndex: 1,
-                  endIndex: a.content.length + 1
-                },
-                paragraphStyle: {
-                  namedStyleType: 'NORMAL_TEXT'
-                },
-                fields: 'namedStyleType'
-              }
-            }
-          ]
+      requests.push({
+        insertText: { location: { index: 1 }, text: a.content }
+      });
+      requests.push({
+        updateParagraphStyle: {
+          range: { startIndex: 1, endIndex: a.content.length + 1 },
+          paragraphStyle: { namedStyleType: 'NORMAL_TEXT' },
+          fields: 'namedStyleType'
         }
       });
+
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: { requests, ...writeControlFor(a.ifRevisionId) }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(updateGoogleDoc.insert)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Updated Google Doc: ${document.data.title}` }],
@@ -2271,17 +3284,27 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const withFormatting = a.includeFormatting === true;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const document = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true,
-      });
+      const document = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(content)',
+        ctx.log
+      );
 
       const { formattedContent, totalLength } = buildDocFormattedContent(document.data, withFormatting);
 
+      // This is the read a caller makes immediately before an index-based
+      // write, so the lock has to be obtainable from it — otherwise the indices
+      // come from one fetch and the lock from a later one.
       return {
         content: [{
           type: "text",
-          text: formattedContent + `\nTotal length: ${totalLength} characters`
+          text: formattedContent
+            + `\nTotal length: ${totalLength} characters`
+            + `\nrevisionId: ${revisionIdOf(document.data)}`
         }],
         isError: false
       };
@@ -2296,16 +3319,23 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const withFormatting = a.includeFormatting === true;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const document = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true,
-      });
+      const document = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(contentPaginated)',
+        ctx.log
+      );
 
       const { formattedContent, totalLength } = buildDocFormattedContent(document.data, withFormatting);
 
       const offset = a.offset;
       const limit = a.limit;
-      const { slice: slicedContent, end } = sliceByLine(formattedContent, offset, limit);
+      // Block-aware: table rows and the cell map carry no index of their own, so
+      // a line-wise split can open a page with bare `| ... |` lines.
+      const { slice: slicedContent, end } = sliceMarkdownByBlock(formattedContent, offset, limit);
       const hasMore = end < formattedContent.length;
 
       const result = {
@@ -2315,6 +3345,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         limit,
         nextOffset: end,
         hasMore,
+        revisionId: revisionIdOf(document.data),
         content: slicedContent,
       };
 
@@ -2333,10 +3364,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
       // Re-fetch the doc so the resolved contentUri is fresh (they expire ~30 min).
-      const docResponse = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true,
-      });
+      const docResponse = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(imageLookup)',
+        ctx.log
+      );
 
       const embedded = findInlineObjectById(docResponse.data, a.inlineObjectId);
       if (!embedded) {
@@ -2365,11 +3401,17 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       // Drive export links elsewhere in this codebase. maxContentLength aborts an
       // oversized body mid-download rather than buffering it all first; the
       // byteLength check below is a backstop for responses lacking Content-Length.
-      const resp = await ctx.authClient.request({
-        url: contentUri,
-        responseType: 'arraybuffer',
-        maxContentLength: MAX_IMAGE_BYTES,
-      });
+      const resp = await withRetry(
+        (signal): Promise<any> => ctx.authClient.request({
+          url: contentUri,
+          responseType: 'arraybuffer',
+          maxContentLength: MAX_IMAGE_BYTES,
+          signal,
+        }),
+        ctx.runtimeConfig,
+        'authClient.request(docImage)',
+        ctx.log
+      );
       const buffer = Buffer.from(resp.data as ArrayBuffer);
 
       if (buffer.byteLength > MAX_IMAGE_BYTES) {
@@ -2378,7 +3420,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         );
       }
 
-      const rawContentType = (resp.headers?.['content-type'] as string | undefined) || 'application/octet-stream';
+      const rawContentType = getResponseHeader(resp.headers, 'content-type') || 'application/octet-stream';
       const mimeType = rawContentType.split(';')[0].trim();
       const dataBase64 = buffer.toString('base64');
 
@@ -2415,11 +3457,16 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       let mimeType = '';
       let fileName = 'unknown';
       try {
-        const fileMeta = await ctx.getDrive().files.get({
-          fileId: a.documentId,
-          fields: 'mimeType, name',
-          supportsAllDrives: true
-        });
+        const fileMeta = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: a.documentId,
+            fields: 'mimeType, name',
+            supportsAllDrives: true
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(insertText.mimeCheck)',
+          ctx.log
+        );
         mimeType = fileMeta.data.mimeType || '';
         fileName = fileMeta.data.name || 'unknown';
       } catch {
@@ -2430,27 +3477,55 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       if (mimeType === 'application/vnd.google-apps.document') {
-        if (a.index < 1) {
+        let index: number;
+        let targetNote = '';
+        if (a.textToFind !== undefined) {
+          const range = await findTextRange(ctx, a.documentId, a.textToFind, a.matchInstance, a.tabId);
+          if (range && 'error' in range) {
+            return errorResponse(range.error);
+          }
+          if (!range) {
+            return errorResponse(`Text "${a.textToFind}" not found in document`);
+          }
+          index = a.position === 'before' ? range.startIndex : range.endIndex;
+          // Docs refuses an insert at the segment end (just past the final
+          // paragraph break). A match that runs to the end of the segment
+          // therefore gets its "after" point moved before that break, which is
+          // still visually after the matched text.
+          if (range.segmentEndIndex !== undefined && index >= range.segmentEndIndex) {
+            index = range.segmentEndIndex - 1;
+          }
+          targetNote = ` (${a.position} "${a.textToFind}"${a.matchInstance > 1 ? ` match ${a.matchInstance}` : ''})`;
+        } else {
+          index = a.index!;
+        }
+        if (index < 1) {
           return errorResponse('For Google Docs, index must be at least 1 (1-based).');
         }
-        const location: { index: number; tabId?: string } = { index: a.index };
+        const location: { index: number; tabId?: string } = { index };
         if (a.tabId) location.tabId = a.tabId;
 
         const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-        await docs.documents.batchUpdate({
-          documentId: a.documentId,
-          requestBody: {
-            requests: [{
-              insertText: {
-                location,
-                text: a.text
-              }
-            }]
-          }
-        });
+        await withRetry(
+          (signal) => docs.documents.batchUpdate({
+            documentId: a.documentId,
+            requestBody: {
+              requests: [{
+                insertText: {
+                  location,
+                  text: a.text
+                }
+              }],
+              ...writeControlFor(a.ifRevisionId)
+            }
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'docs.documents.batchUpdate(insertText)',
+          ctx.log
+        );
 
         return {
-          content: [{ type: "text", text: `Successfully inserted ${a.text.length} characters at index ${a.index}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
+          content: [{ type: "text", text: `Successfully inserted ${a.text.length} characters at index ${index}${targetNote}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
           isError: false
         };
       }
@@ -2459,6 +3534,14 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         if (a.tabId) {
           return errorResponse('tabId is not supported for text files');
         }
+        if (a.textToFind !== undefined) {
+          return errorResponse('textToFind targeting is only supported on Google Docs — pass a 0-based index for text files');
+        }
+        if (a.ifRevisionId) {
+          // Silently ignoring the lock is worse than refusing it: the caller
+          // believes the write was guarded when nothing checked it.
+          return errorResponse('ifRevisionId is only supported for Google Docs, not text files');
+        }
 
         const content = await downloadTextContent(ctx.getDrive(), a.documentId);
         // Index offsets are 0-based Unicode code points, so edit on the code-point
@@ -2466,7 +3549,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         // pair and corrupt astral characters (emoji) on write-back.
         const codePoints = Array.from(content);
 
-        if (a.index > codePoints.length) {
+        if (a.index! > codePoints.length) {
           return errorResponse(`index ${a.index} is beyond end of file (length ${codePoints.length})`);
         }
 
@@ -2491,18 +3574,19 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      if (a.endIndex <= a.startIndex) {
-        return errorResponse("endIndex must be greater than startIndex");
-      }
-
       let mimeType = '';
       let fileName = 'unknown';
       try {
-        const fileMeta = await ctx.getDrive().files.get({
-          fileId: a.documentId,
-          fields: 'mimeType, name',
-          supportsAllDrives: true
-        });
+        const fileMeta = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: a.documentId,
+            fields: 'mimeType, name',
+            supportsAllDrives: true
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(deleteRange.mimeCheck)',
+          ctx.log
+        );
         mimeType = fileMeta.data.mimeType || '';
         fileName = fileMeta.data.name || 'unknown';
       } catch {
@@ -2513,27 +3597,61 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       if (mimeType === 'application/vnd.google-apps.document') {
-        if (a.startIndex < 1) {
+        let startIndex: number;
+        let endIndex: number;
+        let targetNote = '';
+        if (a.textToFind !== undefined) {
+          const found = await findTextRange(ctx, a.documentId, a.textToFind, a.matchInstance, a.tabId);
+          if (found && 'error' in found) {
+            return errorResponse(found.error);
+          }
+          if (!found) {
+            return errorResponse(`Text "${a.textToFind}" not found in document`);
+          }
+          startIndex = found.startIndex;
+          endIndex = found.endIndex;
+          targetNote = ` ("${a.textToFind}"${a.matchInstance > 1 ? ` match ${a.matchInstance}` : ''})`;
+          // Docs refuses to delete a segment's final paragraph break. A match
+          // that runs to the segment end is trimmed by one so the break
+          // survives; a match that is only that break has nothing left to delete.
+          if (found.segmentEndIndex !== undefined && endIndex >= found.segmentEndIndex) {
+            endIndex = found.segmentEndIndex - 1;
+            if (endIndex <= startIndex) {
+              return errorResponse(`Text "${a.textToFind}" matches only the document's final paragraph break, which Google Docs does not allow deleting`);
+            }
+            targetNote += ' (trailing paragraph break kept)';
+          }
+        } else {
+          startIndex = a.startIndex!;
+          endIndex = a.endIndex!;
+        }
+        if (startIndex < 1) {
           return errorResponse('For Google Docs, startIndex must be at least 1 (1-based).');
         }
         const range: { startIndex: number; endIndex: number; tabId?: string } = {
-          startIndex: a.startIndex,
-          endIndex: a.endIndex
+          startIndex,
+          endIndex
         };
         if (a.tabId) range.tabId = a.tabId;
 
         const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-        await docs.documents.batchUpdate({
-          documentId: a.documentId,
-          requestBody: {
-            requests: [{
-              deleteContentRange: { range }
-            }]
-          }
-        });
+        await withRetry(
+          (signal) => docs.documents.batchUpdate({
+            documentId: a.documentId,
+            requestBody: {
+              requests: [{
+                deleteContentRange: { range }
+              }],
+              ...writeControlFor(a.ifRevisionId)
+            }
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'docs.documents.batchUpdate(deleteRange)',
+          ctx.log
+        );
 
         return {
-          content: [{ type: "text", text: `Successfully deleted content from index ${a.startIndex} to ${a.endIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
+          content: [{ type: "text", text: `Successfully deleted content from index ${startIndex} to ${endIndex}${targetNote}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
           isError: false
         };
       }
@@ -2542,22 +3660,32 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         if (a.tabId) {
           return errorResponse('tabId is not supported for text files');
         }
+        if (a.textToFind !== undefined) {
+          return errorResponse('textToFind targeting is only supported on Google Docs — pass 0-based startIndex/endIndex for text files');
+        }
+        if (a.ifRevisionId) {
+          // Silently ignoring the lock is worse than refusing it: the caller
+          // believes the write was guarded when nothing checked it.
+          return errorResponse('ifRevisionId is only supported for Google Docs, not text files');
+        }
 
+        const startIndex = a.startIndex!;
+        const endIndex = a.endIndex!;
         const content = await downloadTextContent(ctx.getDrive(), a.documentId);
         // Offsets are 0-based Unicode code points, so edit on the code-point array
         // — slicing the raw JS string (UTF-16 units) would split a surrogate pair
         // and corrupt astral characters (emoji) on write-back.
         const codePoints = Array.from(content);
 
-        if (a.endIndex > codePoints.length) {
-          return errorResponse(`endIndex ${a.endIndex} is beyond end of file (length ${codePoints.length})`);
+        if (endIndex > codePoints.length) {
+          return errorResponse(`endIndex ${endIndex} is beyond end of file (length ${codePoints.length})`);
         }
 
-        const updated = codePoints.slice(0, a.startIndex).join('') + codePoints.slice(a.endIndex).join('');
+        const updated = codePoints.slice(0, startIndex).join('') + codePoints.slice(endIndex).join('');
         await writeTextContent(ctx.getDrive(), a.documentId, mimeType, updated);
 
         return {
-          content: [{ type: "text", text: `Successfully deleted ${a.endIndex - a.startIndex} characters from offset ${a.startIndex} to ${a.endIndex} in ${fileName}` }],
+          content: [{ type: "text", text: `Successfully deleted ${endIndex - startIndex} characters from offset ${startIndex} to ${endIndex} in ${fileName}` }],
           isError: false
         };
       }
@@ -2575,10 +3703,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const a = validation.data;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const docResponse = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true,
-      });
+      const docResponse = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(readGoogleDoc)',
+        ctx.log
+      );
 
       const doc = docResponse.data;
       const format = a.format || 'text';
@@ -2601,12 +3734,21 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       let resultText = text;
       if (format === 'markdown') {
-        resultText = `# ${doc.title}\n\n${resultText}`;
+        resultText = withMarkdownTitle(doc.title, resultText);
       }
 
-      if (a.maxLength && resultText.length > a.maxLength) {
-        resultText = resultText.substring(0, a.maxLength) + '\n... (truncated)';
+      // Surface the revision so callers can optimistically lock their writes
+      // (pass it as ifRevisionId on any Docs write tool). The line is counted
+      // against maxLength and kept whole, so a truncated read is still lockable
+      // and the response still honors the cap the caller asked for.
+      const revisionLine = `revisionId: ${revisionIdOf(doc)}\n`;
+      if (a.maxLength) {
+        const room = Math.max(0, a.maxLength - revisionLine.length);
+        if (resultText.length > room) {
+          resultText = resultText.substring(0, room) + '\n... (truncated)';
+        }
       }
+      resultText = revisionLine + resultText;
 
       return {
         content: [{ type: "text", text: resultText }],
@@ -2622,10 +3764,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const a = validation.data;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const docResponse = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true,
-      });
+      const docResponse = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(readGoogleDocPaginated)',
+        ctx.log
+      );
 
       const doc = docResponse.data;
       const format = a.format || 'text';
@@ -2637,12 +3784,14 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       let fullText = text;
       if (format === 'markdown') {
-        fullText = `# ${doc.title}\n\n${fullText}`;
+        fullText = withMarkdownTitle(doc.title, fullText);
       }
 
       const offset = a.offset;
       const limit = a.limit;
-      const { slice: slicedText, end } = sliceByLine(fullText, offset, limit);
+      const { slice: slicedText, end } = format === 'markdown'
+        ? sliceMarkdownByBlock(fullText, offset, limit)
+        : sliceByLine(fullText, offset, limit);
       const hasMore = end < fullText.length;
 
       const result = {
@@ -2670,10 +3819,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
       // Use includeTabsContent to get the new tabs structure
-      const docResponse = await docs.documents.get({
-        documentId: a.documentId,
-        includeTabsContent: true
-      });
+      const docResponse = await withRetry(
+        (signal) => docs.documents.get({
+          documentId: a.documentId,
+          includeTabsContent: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(listDocumentTabs)',
+        ctx.log
+      );
 
       const doc = docResponse.data;
 
@@ -2803,12 +3957,18 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [styleResult.request]
-        }
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [styleResult.request],
+            ...writeControlFor(a.ifRevisionId)
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(textStyle)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Successfully applied text style to range ${startIndex}-${endIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
@@ -2889,10 +4049,22 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         alignment: a.alignment,
         indentStart: a.indentStart,
         indentEnd: a.indentEnd,
+        indentFirstLine: a.indentFirstLine,
         spaceAbove: a.spaceAbove,
         spaceBelow: a.spaceBelow,
         namedStyleType: a.namedStyleType,
-        keepWithNext: a.keepWithNext
+        keepWithNext: a.keepWithNext,
+        keepLinesTogether: a.keepLinesTogether,
+        avoidWidowAndOrphan: a.avoidWidowAndOrphan,
+        pageBreakBefore: a.pageBreakBefore,
+        borderTop: a.borderTop,
+        borderBottom: a.borderBottom,
+        borderLeft: a.borderLeft,
+        borderRight: a.borderRight,
+        borderBetween: a.borderBetween,
+        removeBorders: a.removeBorders,
+        shading: a.shading,
+        removeShading: a.removeShading
       };
 
       // Build the update request
@@ -2902,12 +4074,18 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [styleResult.request]
-        }
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [styleResult.request],
+            ...writeControlFor(a.ifRevisionId)
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(paragraphStyle)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Successfully applied paragraph style to range ${startIndex}-${endIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
@@ -2954,31 +4132,43 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
       if (a.bulletPreset === 'NONE') {
-        await docs.documents.batchUpdate({
-          documentId: a.documentId,
-          requestBody: {
-            requests: [{
-              deleteParagraphBullets: { range }
-            }]
-          }
-        });
+        await withRetry(
+          (signal) => docs.documents.batchUpdate({
+            documentId: a.documentId,
+            requestBody: {
+              requests: [{
+                deleteParagraphBullets: { range }
+              }],
+              ...writeControlFor(a.ifRevisionId)
+            }
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'docs.documents.batchUpdate(deleteParagraphBullets)',
+          ctx.log
+        );
         return {
           content: [{ type: "text", text: `Removed bullets from range ${startIndex}-${endIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
           isError: false
         };
       }
 
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [{
-            createParagraphBullets: {
-              range,
-              bulletPreset: a.bulletPreset
-            }
-          }]
-        }
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [{
+              createParagraphBullets: {
+                range,
+                bulletPreset: a.bulletPreset
+              }
+            }],
+            ...writeControlFor(a.ifRevisionId)
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(createParagraphBullets)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Applied ${a.bulletPreset} bullets to range ${startIndex}-${endIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
@@ -2996,24 +4186,132 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
       if (a.dryRun) {
-        const doc = await docs.documents.get({ documentId: a.documentId });
-        let text = '';
-        const content = doc.data.body?.content || [];
-        for (const el of content) {
-          if (el.paragraph?.elements) {
-            for (const elem of el.paragraph.elements) {
-              if (elem.textRun?.content) text += elem.textRun.content;
-            }
-          }
+        const doc = await withRetry(
+          (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(findAndReplaceDryRun)',
+          ctx.log
+        );
+        const text = collectDocPlainText(doc.data, a.tabId);
+        const count = countOccurrences(text, a.findText, a.matchCase);
+        let message = `Dry run: found ${count} occurrence(s) of "${a.findText}"${a.tabId ? ` in tab ${a.tabId}` : ''} (counted across body, tables, headers, footers, and footnotes).`;
+        if (count === 0) {
+          const hint = diagnoseZeroMatch(text, a.findText, a.matchCase);
+          if (hint) message += `\nLikely cause: ${hint}.`;
         }
-        const escaped = a.findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const flags = a.matchCase ? 'g' : 'gi';
-        const matches = text.match(new RegExp(escaped, flags));
-        const count = matches ? matches.length : 0;
         return {
-          content: [{ type: 'text', text: `Dry run (paragraph text only, approximate): found ${count} occurrence(s) of "${a.findText}". Note: actual replacement covers the full document including tables, headers, and footers.` }],
+          content: [{ type: 'text', text: message }],
           isError: false,
         };
+      }
+
+      // Multi-line replacements: replaceAllText does not render an embedded
+      // newline as a paragraph break, so the surrounding paragraphs flatten and
+      // characters are lost. Compile to deleteContentRange + insertText instead —
+      // insertText renders \n as real paragraph breaks, descending order keeps
+      // every index valid, and the whole batch applies atomically.
+      if (a.replaceText.includes('\n')) {
+        if (a.findText.includes('\n')) {
+          return errorResponse(
+            'Multi-line findText is not supported: matches cannot span paragraph breaks. Use a single-line findText (the replacement may contain \\n).',
+          );
+        }
+        const doc = await withRetry(
+          (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(findAndReplaceInDoc.multiline)',
+          ctx.log
+        );
+        const text = collectDocPlainText(doc.data, a.tabId);
+        const plainCount = countOccurrences(text, a.findText, a.matchCase);
+        const ranges = findOccurrenceRanges(doc.data, a.findText, a.matchCase, a.tabId);
+        if (ranges.length === 0) {
+          let msg = `Replaced 0 occurrence(s) of "${a.findText}".`;
+          const hint = diagnoseZeroMatch(text, a.findText, a.matchCase);
+          if (hint) msg += `\nLikely cause: ${hint}.`;
+          return { content: [{ type: 'text', text: msg }], isError: false };
+        }
+        if (plainCount !== ranges.length) {
+          return errorResponse(
+            `Cannot safely apply a multi-line replacement here: ${plainCount} plain-text match(es) but only ${ranges.length} could be index-mapped. Re-read the document and use index-based edits instead.`,
+          );
+        }
+        if (a.expectedCount !== undefined && ranges.length !== a.expectedCount) {
+          return {
+            content: [{ type: 'text', text: `Aborted without writing: expectedCount=${a.expectedCount} but found ${ranges.length} occurrence(s) of "${a.findText}".` }],
+            isError: true,
+          };
+        }
+        const requests = buildMultilineReplaceRequests(ranges, a.replaceText);
+        // Lock the batch to the revision the ranges were located against: the
+        // compiled indices are only valid for that revision. An explicit
+        // ifRevisionId wins, so a caller's older read still guards the write.
+        // Held in a variable so the catch below can tell whether this write
+        // actually carried a lock.
+        const lock = a.ifRevisionId ?? (doc.data.revisionId || undefined);
+        try {
+          await withRetry(
+            (signal) => docs.documents.batchUpdate({
+              documentId: a.documentId,
+              requestBody: {
+                requests: requests as any[],
+                ...writeControlFor(lock),
+              },
+            }, { signal }),
+            { ...ctx.runtimeConfig, retryMax: 0 },
+            'docs.documents.batchUpdate(findAndReplaceInDoc.multiline)',
+            ctx.log
+          );
+        } catch (error: any) {
+          ctx.log('Error in multi-line findAndReplaceInDoc batch:', error.message);
+          // A 400 on a locked write is the lock failing: these requests were
+          // compiled from the same read the lock came from, so with that
+          // revision pinned the indices are valid by construction. Google
+          // documents the 400 for a requiredRevisionId mismatch but not the
+          // message it carries, so keying on the wording would stop firing
+          // without any test noticing if Google reworded it. Whether a lock
+          // was sent is knowable here and cannot drift. The API's own message
+          // is passed through, so a 400 from some other cause stays
+          // diagnosable rather than being replaced by this explanation.
+          if (lock !== undefined && (error.status ?? error.code) === 400) {
+            throw new Error(
+              'The document changed between the read and the write (revision mismatch). ' +
+                `Re-read the document and retry. (Google Docs API: ${error.message})`,
+            );
+          }
+          throw error;
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: `Replaced ${ranges.length} occurrence(s) of "${a.findText}" with a multi-line replacement (compiled to ${requests.length} delete+insert requests in one atomic batch; \\n rendered as real paragraph breaks).`,
+          }],
+          isError: false,
+        };
+      }
+
+      // expectedCount is a pre-write guard: count exactly first, refuse to
+      // write on a mismatch (substring collisions become a refused call, not a
+      // revert). The count walks the same text surface replaceAllText targets.
+      if (a.expectedCount !== undefined) {
+        const doc = await withRetry(
+          (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(findAndReplaceInDoc.expectedCount)',
+          ctx.log
+        );
+        const text = collectDocPlainText(doc.data, a.tabId);
+        const preCount = countOccurrences(text, a.findText, a.matchCase);
+        if (preCount !== a.expectedCount) {
+          let message = `Aborted without writing: expectedCount=${a.expectedCount} but found ${preCount} occurrence(s) of "${a.findText}"${a.tabId ? ` in tab ${a.tabId}` : ''}.`;
+          if (preCount === 0) {
+            const hint = diagnoseZeroMatch(text, a.findText, a.matchCase);
+            if (hint) message += `\nLikely cause: ${hint}.`;
+          } else if (preCount > a.expectedCount) {
+            message += ' The extra matches may be substring collisions elsewhere in the document — use a longer, unique findText.';
+          }
+          return { content: [{ type: 'text', text: message }], isError: true };
+        }
       }
 
       const replaceAllText: {
@@ -3026,16 +4324,41 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       };
       if (a.tabId) replaceAllText.tabsCriteria = { tabIds: [a.tabId] };
 
-      const response = await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [{ replaceAllText }],
-        },
-      });
+      const response = await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [{ replaceAllText }],
+            ...writeControlFor(a.ifRevisionId),
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(replaceAllText)',
+        ctx.log
+      );
 
       const occurrences = response.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+      let message = `Replaced ${occurrences} occurrence(s) of "${a.findText}"${a.tabId ? ` in tab ${a.tabId}` : ''}.`;
+      if (occurrences === 0) {
+        // A zero-match silent no-op has repeatedly hidden lookalike-character
+        // problems; spend one read explaining why nothing matched.
+        try {
+          const doc = await withRetry(
+            (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+            ctx.runtimeConfig,
+            'docs.documents.get(findAndReplaceInDoc.diagnose)',
+            ctx.log
+          );
+          const hint = diagnoseZeroMatch(collectDocPlainText(doc.data, a.tabId), a.findText, a.matchCase);
+          if (hint) message += `\nLikely cause: ${hint}.`;
+        } catch {
+          // diagnosis is best-effort; the zero count already stands on its own
+        }
+      } else if (a.expectedCount !== undefined && occurrences !== a.expectedCount) {
+        message += `\nWARNING: ${a.expectedCount} matches were verified immediately before writing but ${occurrences} were changed — the document was edited concurrently. Re-read before further edits.`;
+      }
       return {
-        content: [{ type: 'text', text: `Replaced ${occurrences} occurrence(s) of "${a.findText}"${a.tabId ? ` in tab ${a.tabId}` : ''}.` }],
+        content: [{ type: 'text', text: message }],
         isError: false,
       };
     }
@@ -3051,13 +4374,18 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      const response = await ctx.getDrive().comments.list({
-        fileId: a.documentId,
-        fields: 'comments(id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)),nextPageToken',
-        pageSize: a.pageSize || 100,
-        pageToken: a.pageToken,
-        includeDeleted: a.includeDeleted || false,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().comments.list({
+          fileId: a.documentId,
+          fields: 'comments(id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)),nextPageToken',
+          pageSize: a.pageSize || 100,
+          pageToken: a.pageToken,
+          includeDeleted: a.includeDeleted || false,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.comments.list',
+        ctx.log
+      );
 
       const comments = response.data.comments || [];
       const nextPageToken = response.data.nextPageToken;
@@ -3083,11 +4411,16 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       let needsDocxFallback = false;
       let isGoogleDoc = false;
       try {
-        const fileInfo = await ctx.getDrive().files.get({
-          fileId: a.documentId,
-          fields: 'mimeType',
-          supportsAllDrives: true,
-        });
+        const fileInfo = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: a.documentId,
+            fields: 'mimeType',
+            supportsAllDrives: true,
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(listComments.mimeCheck)',
+          ctx.log
+        );
         isGoogleDoc = fileInfo.data.mimeType === 'application/vnd.google-apps.document';
       } catch (err) {
         ctx.log('Failed to check file MIME type:', err);
@@ -3096,10 +4429,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       if (isGoogleDoc) {
         try {
           const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-          const docResponse = await docs.documents.get({
-            documentId: a.documentId,
-            includeTabsContent: true,
-          });
+          const docResponse = await withRetry(
+            (signal) => docs.documents.get({
+              documentId: a.documentId,
+              includeTabsContent: true,
+            }, { signal }),
+            ctx.runtimeConfig,
+            'docs.documents.get(listComments.tier1)',
+            ctx.log
+          );
 
           const result = buildFlatTextFromDoc(docResponse.data);
           flatText = result.flatText;
@@ -3167,10 +4505,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
         if (unresolved.length > 0) {
           try {
-            const docxResponse = await ctx.getDrive().files.export({
-              fileId: a.documentId,
-              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            }, { responseType: 'arraybuffer' });
+            const docxResponse = await withRetry(
+              (signal) => ctx.getDrive().files.export({
+                fileId: a.documentId,
+                mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              }, { responseType: 'arraybuffer', signal }),
+              ctx.runtimeConfig,
+              'drive.files.export(listComments.tier2)',
+              ctx.log
+            );
 
             const docxResult = await resolveContextFromDocx(docxResponse.data as ArrayBuffer);
             if (docxResult) {
@@ -3236,11 +4579,16 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      const response = await ctx.getDrive().comments.get({
-        fileId: a.documentId,
-        commentId: a.commentId,
-        fields: 'id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)'
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().comments.get({
+          fileId: a.documentId,
+          commentId: a.commentId,
+          fields: 'id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.comments.get',
+        ctx.log
+      );
 
       const comment = response.data;
       const author = comment.author?.displayName || 'Unknown';
@@ -3273,62 +4621,94 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      if (a.endIndex <= a.startIndex) {
-        return errorResponse("endIndex must be greater than startIndex");
+      const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
+
+      // Resolve the targeted body ONCE. Index spaces are per-tab, so the range
+      // lookup and the quote extraction must read the same content -- reading
+      // different bodies would quote text from the wrong tab.
+      let content: any[];
+      if (a.tabId) {
+        const resolved = await getTabBodyContent(ctx, a.documentId, a.tabId);
+        if (resolved.error) {
+          return errorResponse(resolved.error);
+        }
+        content = resolved.content!;
+      } else {
+        const doc = await withRetry(
+          (signal) => docs.documents.get({ documentId: a.documentId }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(addComment)',
+          ctx.log
+        );
+        content = doc.data.body?.content || [];
       }
 
-      // Get the document to extract quoted text
-      const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const doc = await docs.documents.get({ documentId: a.documentId });
+      let startIndex: number;
+      let endIndex: number;
+      if (a.textToFind) {
+        const range = await findTextRange(
+          ctx, a.documentId, a.textToFind, a.matchInstance, a.tabId, content);
+        if (range && 'error' in range) {
+          return errorResponse(range.error);
+        }
+        if (!range) {
+          return errorResponse(`textToFind "${a.textToFind}" not found in document.`);
+        }
+        startIndex = range.startIndex;
+        endIndex = range.endIndex;
+      } else {
+        startIndex = a.startIndex!;
+        endIndex = a.endIndex!;
+        if (endIndex <= startIndex) {
+          return errorResponse("endIndex must be greater than startIndex");
+        }
+      }
 
-      // Extract quoted text from the range
+      // buildFlatTextFromDoc walks paragraphs and nested tables. The previous
+      // scan looked only at top-level body paragraphs, so any range inside a
+      // table quoted '' and left the comment with no recoverable position.
+      const { flatText, offsetMap } = buildFlatTextFromDoc({ body: { content } });
       let quotedText = '';
-      const content = doc.data.body?.content || [];
-      for (const element of content) {
-        if (element.paragraph?.elements) {
-          for (const textElement of element.paragraph.elements) {
-            if (textElement.textRun) {
-              const elementStart = textElement.startIndex || 0;
-              const elementEnd = textElement.endIndex || 0;
+      for (let i = 0; i < offsetMap.length; i++) {
+        if (offsetMap[i] >= startIndex && offsetMap[i] < endIndex) {
+          quotedText += flatText[i];
+        }
+      }
+      if (!quotedText) {
+        return errorResponse(
+          `Range [${startIndex}-${endIndex}] covers no text in the document.`);
+      }
 
-              if (elementEnd > a.startIndex && elementStart < a.endIndex) {
-                const text = textElement.textRun.content || '';
-                const startOffset = Math.max(0, a.startIndex - elementStart);
-                const endOffset = Math.min(text.length, a.endIndex - elementStart);
-                quotedText += text.substring(startOffset, endOffset);
-              }
+      // Deliberately NO anchor. Google Docs cannot be given an anchored comment
+      // through any public API: the Docs API has no comment surface at all, and
+      // Drive's `anchor` field is ignored by the Workspace editors, which
+      // "treat these comments as un-anchored comments" per
+      // https://developers.google.com/workspace/drive/api/guides/manage-comments
+      // Sending an anchor Docs cannot resolve is worse than sending none: the
+      // editor renders the thread under "Original content was deleted", so the
+      // comment reads as if the passage it refers to had been removed.
+      // quotedFileContent is what ties the comment to its passage, and is what
+      // listComments matches on to report character positions.
+      const response = await withRetry(
+        (signal) => ctx.getDrive().comments.create({
+          fileId: a.documentId,
+          fields: 'id,content,quotedFileContent,author,createdTime',
+          requestBody: {
+            content: a.commentText,
+            quotedFileContent: {
+              value: quotedText,
+              mimeType: 'text/plain'
             }
           }
-        }
-      }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.comments.create',
+        ctx.log
+      );
 
-      const response = await ctx.getDrive().comments.create({
-        fileId: a.documentId,
-        fields: 'id,content,quotedFileContent,author,createdTime',
-        requestBody: {
-          content: a.commentText,
-          quotedFileContent: {
-            value: quotedText,
-            mimeType: 'text/html'
-          },
-          // Reverse-engineered anchor format for positioning comments.
-          // Not part of the public Drive API -- may break if Google changes internals.
-          // See: https://stackoverflow.com/questions/51789168
-          anchor: JSON.stringify({
-            r: a.documentId,
-            a: [{
-              txt: {
-                o: a.startIndex - 1,  // Drive API uses 0-based indexing
-                l: a.endIndex - a.startIndex,
-                ml: a.endIndex - a.startIndex
-              }
-            }]
-          })
-        }
-      });
-
+      const snippet = quotedText.length > 60 ? `${quotedText.slice(0, 60)}...` : quotedText;
       return {
-        content: [{ type: "text", text: `Comment added successfully. Comment ID: ${response.data.id}` }],
+        content: [{ type: "text", text: `Comment added (id ${response.data.id}) quoting "${snippet}" at [${startIndex}-${endIndex}]. Google Docs shows API-created comments in the comment panel without a margin anchor.` }],
         isError: false
       };
     }
@@ -3340,15 +4720,20 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      const response = await ctx.getDrive().replies.create({
-        fileId: a.documentId,
-        commentId: a.commentId,
-        fields: 'id,content,author,createdTime',
-        requestBody: {
-          content: a.replyText,
-          ...(a.resolve && { action: "resolve" })
-        }
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().replies.create({
+          fileId: a.documentId,
+          commentId: a.commentId,
+          fields: 'id,content,author,createdTime',
+          requestBody: {
+            content: a.replyText,
+            ...(a.resolve && { action: "resolve" })
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.replies.create',
+        ctx.log
+      );
 
       const resolveNote = a.resolve ? ' Comment thread resolved.' : '';
       return {
@@ -3364,10 +4749,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      await ctx.getDrive().comments.delete({
-        fileId: a.documentId,
-        commentId: a.commentId
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().comments.delete({
+          fileId: a.documentId,
+          commentId: a.commentId
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.comments.delete',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Comment ${a.commentId} has been deleted.` }],
@@ -3398,7 +4788,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         }
       };
 
-      await executeBatchUpdate(ctx, a.documentId, [request_body]);
+      await executeBatchUpdate(ctx, a.documentId, [request_body], a.ifRevisionId);
 
       return {
         content: [{ type: "text", text: `Successfully inserted ${a.rows}x${a.columns} table at index ${a.index}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
@@ -3426,10 +4816,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         }
         docContent = resolved.content;
       } else {
-        const docRes = await docs.documents.get({
-          documentId: a.documentId,
-          fields: 'body(content)'
-        });
+        const docRes = await withRetry(
+          (signal) => docs.documents.get({
+            documentId: a.documentId,
+            fields: 'body(content)'
+          }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(editTableCell)',
+          ctx.log
+        );
         docContent = docRes.data.body?.content ?? undefined;
       }
 
@@ -3535,10 +4930,38 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         return errorResponse("No changes specified for the table cell");
       }
 
-      await executeBatchUpdate(ctx, a.documentId, requests);
+      await executeBatchUpdate(ctx, a.documentId, requests, a.ifRevisionId);
 
       return {
         content: [{ type: "text", text: `Successfully edited cell at row ${a.rowIndex}, column ${a.columnIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}` }],
+        isError: false
+      };
+    }
+
+    case "styleDocTable": {
+      const validation = StyleDocTableSchema.safeParse(args);
+      if (!validation.success) {
+        return errorResponse(validation.error.errors[0].message);
+      }
+      const a = validation.data;
+
+      let built: { requests: any[]; applied: string[] };
+      try {
+        built = buildStyleDocTableRequests(a);
+      } catch (err) {
+        return errorResponse(err instanceof Error ? err.message : String(err));
+      }
+      if (built.requests.length === 0) {
+        return errorResponse("No table style options provided");
+      }
+
+      // Same path as insertTable/editTableCell: executeBatchUpdate threads the
+      // lock and maps 404/403 to the server's wording instead of leaking the
+      // raw gaxios error.
+      await executeBatchUpdate(ctx, a.documentId, built.requests, a.ifRevisionId);
+
+      return {
+        content: [{ type: "text", text: `Styled table at index ${a.tableStartIndex}${a.tabId ? ` in tab ${a.tabId}` : ''}: ${built.applied.join('; ')}` }],
         isError: false
       };
     }
@@ -3568,11 +4991,16 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       // Get the document's parent folder if uploadToSameFolder is true
       let parentFolderId: string | undefined;
       if (a.uploadToSameFolder !== false) {
-        const fileInfo = await ctx.getDrive().files.get({
-          fileId: a.documentId,
-          fields: 'parents',
-          supportsAllDrives: true
-        });
+        const fileInfo = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: a.documentId,
+            fields: 'parents',
+            supportsAllDrives: true
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(insertLocalImage.parent)',
+          ctx.log
+        );
         parentFolderId = fileInfo.data.parents?.[0];
       }
 
@@ -3609,13 +5037,18 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         queryString += ` and (name contains '${escapedQuery}' or fullText contains '${escapedQuery}')`;
       }
 
-      const response = await ctx.getDrive().files.list({
-        q: queryString,
-        pageSize: a.maxResults,
-        orderBy: a.orderBy === 'name' ? 'name' : a.orderBy,
-        fields: 'files(id,name,modifiedTime,createdTime,size,webViewLink,owners(displayName,emailAddress))',
-        ...ALL_DRIVES_LIST_PARAMS
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().files.list({
+          q: queryString,
+          pageSize: a.maxResults,
+          orderBy: a.orderBy,
+          fields: 'files(id,name,modifiedTime,createdTime,size,webViewLink,owners(displayName,emailAddress))',
+          ...ALL_DRIVES_LIST_PARAMS
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.list(listGoogleDocs)',
+        ctx.log
+      );
 
       const files = response.data.files || [];
 
@@ -3623,7 +5056,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         return { content: [{ type: "text", text: "No Google Docs found matching your criteria." }], isError: false };
       }
 
-      let result = `Found ${files.length} Google Document(s):\n\n`;
+      let result = `Found ${files.length} Google Document(s) (ordered by ${a.orderBy}):\n\n`;
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const modifiedDate = file.modifiedTime ? new Date(file.modifiedTime).toLocaleDateString() : 'Unknown';
@@ -3645,16 +5078,39 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      const response = await ctx.getDrive().files.get({
-        fileId: a.documentId,
-        fields: 'id,name,description,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),shared,parents,version',
-        supportsAllDrives: true,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: a.documentId,
+          fields: 'id,name,description,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),shared,parents,version',
+          supportsAllDrives: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(getDocumentInfo)',
+        ctx.log
+      );
 
       const file = response.data;
 
       if (!file) {
         return errorResponse(`Document with ID ${a.documentId} not found.`);
+      }
+
+      // The Drive `version` above is not a Docs revisionId and WriteControl
+      // rejects it, so fetch the real one. Narrow projection, and non-fatal:
+      // a caller without edit access (or a Drive file that is not a Doc) still
+      // gets the metadata rather than an error from the lock lookup.
+      let docsRevisionId = REVISION_UNAVAILABLE;
+      try {
+        const docMeta = await withRetry(
+          (signal) => ctx.google.docs({ version: 'v1', auth: ctx.authClient })
+            .documents.get({ documentId: a.documentId, fields: 'revisionId' }, { signal }),
+          ctx.runtimeConfig,
+          'docs.documents.get(getDocumentInfo)',
+          ctx.log
+        );
+        docsRevisionId = revisionIdOf(docMeta.data);
+      } catch {
+        // Leave it unavailable; the metadata below is still worth returning.
       }
 
       const createdDate = file.createdTime ? new Date(file.createdTime).toLocaleString() : 'Unknown';
@@ -3682,10 +5138,83 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       result += `**Shared:** ${file.shared ? 'Yes' : 'No'}\n`;
-      result += `**Version:** ${file.version || 'Unknown'}\n`;
+      result += `**Drive Version:** ${file.version || 'Unknown'} (Drive's change counter — not a lock)\n`;
+      result += `**Docs revisionId:** ${docsRevisionId} (pass as ifRevisionId to lock a write)\n`;
       result += `**View Link:** ${file.webViewLink}\n`;
 
       return { content: [{ type: "text", text: result }], isError: false };
+    }
+
+    case "getGoogleDocStyleSummary": {
+      const validation = GetGoogleDocStyleSummarySchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
+      const doc = await withRetry(
+        (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(styleSummary)',
+        ctx.log
+      );
+      const resolved = resolveBodySegments(doc.data, a.tabId);
+      if ('error' in resolved) return errorResponse(resolved.error);
+
+      const summary = summarizeDocumentStyles(resolved.segments);
+      return {
+        content: [{
+          type: 'text',
+          text: `Style summary for "${doc.data.title}"${a.tabId ? ` (tab ${a.tabId})` : ''}\n`
+            + `revisionId: ${revisionIdOf(doc.data)}\n`
+            + summary
+        }],
+        isError: false,
+      };
+    }
+
+    case "describeGoogleDocRange": {
+      const validation = DescribeGoogleDocRangeSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
+      const doc = await withRetry(
+        (signal) => docs.documents.get({ documentId: a.documentId, includeTabsContent: true }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(describeRange)',
+        ctx.log
+      );
+      // Default to the first tab: every other index-taking Docs tool does, and
+      // describing all of them at once would report overlapping ranges.
+      const resolved = resolveBodySegments(doc.data, a.tabId);
+      if ('error' in resolved) return errorResponse(resolved.error);
+      const content = resolved.segments[0]?.content;
+
+      let startIndex: number;
+      let endIndex: number;
+      if (a.textToFind) {
+        // Resolve against the body we already hold, so the indices and the
+        // revisionId below come from one fetch rather than two.
+        const range = await findTextRange(ctx, a.documentId, a.textToFind, a.matchInstance, a.tabId, content ?? []);
+        if (range && 'error' in range) return errorResponse(range.error);
+        if (!range) return errorResponse(`textToFind "${a.textToFind}" not found in document.`);
+        startIndex = range.startIndex;
+        endIndex = range.endIndex;
+      } else {
+        startIndex = a.startIndex!;
+        endIndex = a.endIndex ?? startIndex + 1;
+      }
+
+      const described = describeRangeStyles(content, startIndex, endIndex);
+      return {
+        content: [{
+          type: 'text',
+          text: `revisionId: ${revisionIdOf(doc.data)}\n`
+            + `target range: [${startIndex}-${endIndex})${a.tabId ? ` in tab ${a.tabId}` : ''}\n`
+            + described
+        }],
+        isError: false,
+      };
     }
 
     case "addDocumentTab": {
@@ -3694,11 +5223,16 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const a = validation.data;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        // addDocumentTab is not yet in the googleapis TypeScript types — cast required
-        requestBody: { requests: [{ addDocumentTab: { tabProperties: { title: a.title } } } as any] }
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          // addDocumentTab is not yet in the googleapis TypeScript types — cast required
+          requestBody: { requests: [{ addDocumentTab: { tabProperties: { title: a.title } } } as any] }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(addDocumentTab)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Requested creation of tab "${a.title}" in document ${a.documentId}.` }], isError: false };
     }
@@ -3709,13 +5243,18 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const a = validation.data;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        // updateDocumentTabProperties is not yet in the googleapis TypeScript types — cast required.
-        // Per Google Docs API spec: tabId lives INSIDE tabProperties (it's the tab identifier),
-        // and `fields` is a FieldMask for which properties to update (excludes tabId).
-        requestBody: { requests: [{ updateDocumentTabProperties: { tabProperties: { tabId: a.tabId, title: a.title }, fields: 'title' } } as any] }
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          // updateDocumentTabProperties is not yet in the googleapis TypeScript types — cast required.
+          // Per Google Docs API spec: tabId lives INSIDE tabProperties (it's the tab identifier),
+          // and `fields` is a FieldMask for which properties to update (excludes tabId).
+          requestBody: { requests: [{ updateDocumentTabProperties: { tabProperties: { tabId: a.tabId, title: a.title }, fields: 'title' } } as any] }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(renameDocumentTab)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Renamed tab ${a.tabId} to "${a.title}".` }], isError: false };
     }
@@ -3728,18 +5267,24 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       // tabId passed through unvalidated by design (see insertTable): no GET on
       // this pure batchUpdate path, so a bad tabId yields the raw Google error.
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [{
-            insertPerson: {
-              personProperties: { email: a.personEmail },
-              location: withTab({ index: a.index }, a.tabId),
-            },
-          // insertPerson is not yet in the googleapis TypeScript types — cast required
-          } as any],
-        },
-      });
+      await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [{
+              insertPerson: {
+                personProperties: { email: a.personEmail },
+                location: withTab({ index: a.index }, a.tabId),
+              },
+            // insertPerson is not yet in the googleapis TypeScript types — cast required
+            } as any],
+            ...writeControlFor(a.ifRevisionId),
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(insertSmartChip)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Inserted person smart chip for ${a.personEmail} at index ${a.index}${a.tabId ? ` in tab ${a.tabId}` : ''}.` }], isError: false };
     }
@@ -3750,7 +5295,12 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       const a = validation.data;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
-      const doc = await docs.documents.get({ documentId: a.documentId });
+      const doc = await withRetry(
+        (signal) => docs.documents.get({ documentId: a.documentId }, { signal }),
+        ctx.runtimeConfig,
+        'docs.documents.get(readSmartChips)',
+        ctx.log
+      );
       const body = (doc.data as any).body?.content || [];
       const hits: string[] = [];
       for (const block of body) {
@@ -3783,12 +5333,21 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         createFootnoteReq.endOfSegmentLocation = withTab({ segmentId: "" }, a.tabId);
       }
 
-      const res = await docs.documents.batchUpdate({
-        documentId: a.documentId,
-        requestBody: {
-          requests: [{ createFootnote: createFootnoteReq }],
-        },
-      });
+      const res = await withRetry(
+        (signal) => docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [{ createFootnote: createFootnoteReq }],
+            // Lock only this creating call: the optional content insert below
+            // targets the new footnote segment, whose revision necessarily
+            // postdates the caller's read.
+            ...writeControlFor(a.ifRevisionId),
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'docs.documents.batchUpdate(createFootnote)',
+        ctx.log
+      );
 
       const footnoteId = res.data.replies?.[0]?.createFootnote?.footnoteId;
       if (!footnoteId) {
@@ -3800,17 +5359,22 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       // Optionally insert text content into the footnote body
       if (a.content) {
         try {
-          await docs.documents.batchUpdate({
-            documentId: a.documentId,
-            requestBody: {
-              requests: [{
-                insertText: {
-                  location: withTab({ segmentId: footnoteId, index: 0 }, a.tabId),
-                  text: a.content,
-                },
-              }],
-            },
-          });
+          await withRetry(
+            (signal) => docs.documents.batchUpdate({
+              documentId: a.documentId,
+              requestBody: {
+                requests: [{
+                  insertText: {
+                    location: withTab({ segmentId: footnoteId, index: 0 }, a.tabId),
+                    text: a.content,
+                  },
+                }],
+              },
+            }, { signal }),
+            { ...ctx.runtimeConfig, retryMax: 0 },
+            'docs.documents.batchUpdate(footnoteContent)',
+            ctx.log
+          );
         } catch (err: any) {
           return { content: [{ type: 'text', text: `Created footnote ${footnoteId} ${locationDesc}, but failed to insert content: ${err.message}` }], isError: true };
         }

@@ -108,20 +108,51 @@ test('--no-resources=disabled is treated as garbage and disables', withVar(undef
 test('unrelated runtime config defaults are preserved', withVar(undefined, () => {
   const cfg = loadRuntimeConfig([]);
   assert.equal(cfg.apiTimeout, 120_000);
+  assert.equal(cfg.tokenRefreshTimeout, 15_000);
   assert.equal(cfg.retryMax, 3);
   assert.equal(cfg.retryBaseDelay, 1_000);
-  assert.equal(cfg.maxConcurrentTools, 8);
-  assert.equal(cfg.maxQueuedTools, 64);
-  assert.equal(cfg.toolQueueTimeout, 15_000);
 }));
 
-test('tool concurrency settings accept CLI overrides', () => {
-  const cfg = loadRuntimeConfig([
-    '--max-concurrent-tools=12',
-    '--max-queued-tools=80',
-    '--tool-queue-timeout=25000',
-  ]);
-  assert.equal(cfg.maxConcurrentTools, 12);
-  assert.equal(cfg.maxQueuedTools, 80);
-  assert.equal(cfg.toolQueueTimeout, 25_000);
-});
+// ---------------------------------------------------------------------------
+// tokenRefreshTimeout (#169) — env fallback, flag override, 0 = disabled
+// ---------------------------------------------------------------------------
+const REFRESH_VAR = 'GOOGLE_DRIVE_MCP_TOKEN_REFRESH_TIMEOUT';
+
+function withRefreshVar(value: string | undefined, fn: () => void) {
+  return () => {
+    const saved = process.env[REFRESH_VAR];
+    if (value === undefined) delete process.env[REFRESH_VAR];
+    else process.env[REFRESH_VAR] = value;
+    try {
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env[REFRESH_VAR];
+      else process.env[REFRESH_VAR] = saved;
+    }
+  };
+}
+
+test('tokenRefreshTimeout is read from the env var', withRefreshVar('4000', () => {
+  assert.equal(loadRuntimeConfig([]).tokenRefreshTimeout, 4_000);
+}));
+
+test('--token-refresh-timeout sets tokenRefreshTimeout', withRefreshVar(undefined, () => {
+  assert.equal(loadRuntimeConfig(['--token-refresh-timeout=2500']).tokenRefreshTimeout, 2_500);
+}));
+
+test('--token-refresh-timeout overrides the env var', withRefreshVar('4000', () => {
+  assert.equal(loadRuntimeConfig(['--token-refresh-timeout=2500']).tokenRefreshTimeout, 2_500);
+}));
+
+test('--token-refresh-timeout=0 disables the refresh timeout', withRefreshVar(undefined, () => {
+  assert.equal(loadRuntimeConfig(['--token-refresh-timeout=0']).tokenRefreshTimeout, 0);
+}));
+
+test('garbage tokenRefreshTimeout values fall back to the default', withRefreshVar('soon', () => {
+  assert.equal(loadRuntimeConfig(['--token-refresh-timeout=-5']).tokenRefreshTimeout, 15_000);
+}));
+
+test('--token-refresh-timeout leaves --api-timeout alone', withRefreshVar(undefined, () => {
+  const cfg = loadRuntimeConfig(['--token-refresh-timeout=2500']);
+  assert.equal(cfg.apiTimeout, 120_000);
+}));

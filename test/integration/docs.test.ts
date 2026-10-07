@@ -124,6 +124,9 @@ describe('Docs tools', () => {
     // per-block override (e.g. insertText/deleteRange forcing a Google-Docs
     // mimeType) does not leak into later tests and make the suite order-dependent.
     ctx.mocks.drive.service.files.get._resetImpl();
+    // Same for docs.documents.get: several blocks install per-test document
+    // fixtures, which must not leak into later blocks.
+    ctx.mocks.docs.service.documents.get._resetImpl();
   });
 
   // --- createGoogleDoc ---
@@ -157,9 +160,12 @@ describe('Docs tools', () => {
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('Updated Google Doc'));
 
-      // Non-tabId path: still two separate batchUpdate calls (existing behavior).
+      // Non-tabId path is now one atomic batchUpdate, like the tabId path: the
+      // delete and insert can no longer half-apply and leave the doc wiped.
       const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
-      assert.equal(calls.length, 2);
+      assert.equal(calls.length, 1);
+      const kinds = calls[0]!.args[0].requestBody.requests.map((r: any) => Object.keys(r)[0]);
+      assert.deepEqual(kinds, ['deleteContentRange', 'insertText', 'updateParagraphStyle']);
     });
 
     it('with tabId issues a single atomic batchUpdate scoped to the tab', async () => {
@@ -298,6 +304,53 @@ describe('Docs tools', () => {
       assert.ok(res.content[0].text!.includes('1-based'));
     });
 
+    it('textToFind inserts after the match by default and before with position', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Hello target world\n' }, startIndex: 1, endIndex: 20 }] } }] },
+        },
+      }));
+
+      const after = await callTool(ctx.client, 'insertText', { documentId: 'doc-1', text: '!', textToFind: 'target' });
+      assert.equal(after.isError, false);
+      let calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      // "target" spans doc indices 7-13, so after = 13.
+      assert.equal(calls[calls.length - 1].args[0].requestBody.requests[0].insertText.location.index, 13);
+
+      const before = await callTool(ctx.client, 'insertText', { documentId: 'doc-1', text: '>', textToFind: 'target', position: 'before' });
+      assert.equal(before.isError, false);
+      calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.equal(calls[calls.length - 1].args[0].requestBody.requests[0].insertText.location.index, 7);
+    });
+
+    it('textToFind not found is an error, and index+textToFind together are refused', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: { documentId: 'doc-1', body: { content: [] } },
+      }));
+      const missing = await callTool(ctx.client, 'insertText', { documentId: 'doc-1', text: 'x', textToFind: 'nope' });
+      assert.equal(missing.isError, true);
+      assert.ok(missing.content[0].text!.includes('not found'));
+
+      const both = await callTool(ctx.client, 'insertText', { documentId: 'doc-1', text: 'x', index: 1, textToFind: 'y' });
+      assert.equal(both.isError, true);
+      assert.ok(both.content[0].text!.includes('exactly one'));
+    });
+
+    it('textToFind after a match that ends at the final paragraph break inserts before that break', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          body: { content: [{ startIndex: 1, endIndex: 11, paragraph: { elements: [{ textRun: { content: 'keep tail\n' }, startIndex: 1, endIndex: 11 }] } }] },
+        },
+      }));
+      // "tail\n" spans 6-11 and 11 is the segment end, so the insert lands at 10.
+      const res = await callTool(ctx.client, 'insertText', { documentId: 'doc-1', text: '!', textToFind: 'tail\n' });
+      assert.equal(res.isError, false);
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.equal(calls[calls.length - 1].args[0].requestBody.requests[0].insertText.location.index, 10);
+    });
+
     it('validation error', async () => {
       const res = await callTool(ctx.client, 'insertText', {});
       assert.equal(res.isError, true);
@@ -342,6 +395,53 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'deleteRange', { documentId: 'doc-1', startIndex: 0, endIndex: 3 });
       assert.equal(res.isError, true);
       assert.ok(res.content[0].text!.includes('1-based'));
+    });
+
+    it('textToFind deletes the matched range', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'keep DELETE keep\n' }, startIndex: 1, endIndex: 18 }] } }] },
+        },
+      }));
+      const res = await callTool(ctx.client, 'deleteRange', { documentId: 'doc-1', textToFind: 'DELETE ' });
+      assert.equal(res.isError, false);
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      const range = calls[calls.length - 1].args[0].requestBody.requests[0].deleteContentRange.range;
+      // "DELETE " spans doc indices 6-13.
+      assert.deepEqual({ startIndex: range.startIndex, endIndex: range.endIndex }, { startIndex: 6, endIndex: 13 });
+    });
+
+    it('textToFind ending at the final paragraph break keeps that break', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          body: { content: [{ startIndex: 1, endIndex: 11, paragraph: { elements: [{ textRun: { content: 'keep tail\n' }, startIndex: 1, endIndex: 11 }] } }] },
+        },
+      }));
+      // "tail\n" spans 6-11; 11 is the segment end, so the range is trimmed to 6-10.
+      const res = await callTool(ctx.client, 'deleteRange', { documentId: 'doc-1', textToFind: 'tail\n' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('paragraph break kept'));
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      const range = calls[calls.length - 1].args[0].requestBody.requests[0].deleteContentRange.range;
+      assert.deepEqual({ startIndex: range.startIndex, endIndex: range.endIndex }, { startIndex: 6, endIndex: 10 });
+
+      // A match that is only the final break has nothing left to delete.
+      const onlyBreak = await callTool(ctx.client, 'deleteRange', { documentId: 'doc-1', textToFind: '\n' });
+      assert.equal(onlyBreak.isError, true);
+      assert.ok(onlyBreak.content[0].text!.includes('final paragraph break'));
+      assert.equal(ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length, calls.length);
+    });
+
+    it('refuses indices and textToFind together, including a single stray index', async () => {
+      for (const extra of [{ startIndex: 1, endIndex: 3 }, { startIndex: 1 }, { endIndex: 3 }]) {
+        const res = await callTool(ctx.client, 'deleteRange', { documentId: 'doc-1', textToFind: 'x', ...extra });
+        assert.equal(res.isError, true, `expected refusal for ${JSON.stringify(extra)}`);
+        assert.ok(res.content[0].text!.includes('not both'), res.content[0].text);
+      }
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.equal(calls.length, 0);
     });
 
     it('validation error', async () => {
@@ -639,6 +739,550 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('![Architecture diagram](https://lh3.googleusercontent.com/xyz "objectId=obj-1")'), res.content[0].text!);
+    });
+
+    it('renders heading paragraphs as ATX hashes (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with headings',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_1' }, elements: [{ textRun: { content: 'Top level\n' } }] } },
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_3' }, elements: [{ textRun: { content: 'Third level\n' } }] } },
+              { paragraph: { paragraphStyle: { namedStyleType: 'NORMAL_TEXT' }, elements: [{ textRun: { content: 'Plain body\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('# Top level\n'), text);
+      assert.ok(text.includes('### Third level\n'), text);
+      assert.ok(text.includes('Plain body\n'), text);
+      assert.ok(!text.includes('# Plain body'), text);
+    });
+
+    it('does not emit a bare hash for an empty heading paragraph (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with empty heading',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_2' }, elements: [{ textRun: { content: '\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(!text.includes('## '), text);
+    });
+
+    it('leaves headings unprefixed in text format', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with headings',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_1' }, elements: [{ textRun: { content: 'Top level\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'text' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('Top level'), text);
+      assert.ok(!text.includes('#'), text);
+    });
+
+    it('wraps bold, italic and strikethrough runs in emphasis (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with emphasis',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'plain ' } },
+                { textRun: { content: 'bold', textStyle: { bold: true } } },
+                { textRun: { content: ' and ' } },
+                { textRun: { content: 'italic', textStyle: { italic: true } } },
+                { textRun: { content: ' and ' } },
+                { textRun: { content: 'struck', textStyle: { strikethrough: true } } },
+                { textRun: { content: '\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('plain **bold** and *italic* and ~~struck~~'), text);
+    });
+
+    it('keeps emphasis markers tight around a run that ends the paragraph (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with trailing emphasis',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'lead ' } },
+                { textRun: { content: 'bold tail\n', textStyle: { bold: true } } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // The newline must fall outside the markers, otherwise the emphasis never closes.
+      assert.ok(text.includes('lead **bold tail**\n'), JSON.stringify(text));
+      assert.ok(!text.includes('\n**'), JSON.stringify(text));
+    });
+
+    it('leaves emphasis unmarked in text format', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with emphasis',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'bold', textStyle: { bold: true } } },
+                { textRun: { content: '\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'text' });
+      assert.equal(res.isError, false);
+      assert.ok(!res.content[0].text!.includes('*'), res.content[0].text!);
+    });
+
+    it('renders bulleted and numbered list items with nesting (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with lists',
+          body: {
+            content: [
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'first\n' } }] } },
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 1 }, elements: [{ textRun: { content: 'nested\n' } }] } },
+              { paragraph: { bullet: { listId: 'l2', nestingLevel: 0 }, elements: [{ textRun: { content: 'step one\n' } }] } },
+            ],
+          },
+          lists: {
+            l1: { listProperties: { nestingLevels: [{ glyphSymbol: '●' }, { glyphSymbol: '○' }] } },
+            l2: { listProperties: { nestingLevels: [{ glyphType: 'DECIMAL' }] } },
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('- first\n'), JSON.stringify(text));
+      assert.ok(text.includes('  - nested\n'), JSON.stringify(text));
+      assert.ok(text.includes('1. step one\n'), JSON.stringify(text));
+    });
+
+    it('renders a bulleted heading as a list item, not a heading (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with bulleted heading',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_2' }, bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'item\n' } }] } },
+            ],
+          },
+          lists: { l1: { listProperties: { nestingLevels: [{ glyphSymbol: '●' }] } } },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('- item\n'), JSON.stringify(text));
+      assert.ok(!text.includes('## item'), JSON.stringify(text));
+    });
+
+    it('renders tables as pipe tables (format=markdown)', async () => {
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with table',
+          body: {
+            content: [
+              { table: { tableRows: [
+                { tableCells: [cell('Owner'), cell('Role')] },
+                { tableCells: [cell('Eero'), cell('CEO')] },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('| Owner | Role |'), JSON.stringify(text));
+      assert.ok(text.includes('| --- | --- |'), JSON.stringify(text));
+      assert.ok(text.includes('| Eero | CEO |'), JSON.stringify(text));
+    });
+
+    it('escapes pipe characters inside table cells (format=markdown)', async () => {
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with pipe',
+          body: {
+            content: [
+              { table: { tableRows: [{ tableCells: [cell('a | b'), cell('c')] }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('| a \\| b | c |'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('separates consecutive paragraphs with a blank line (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with paragraphs',
+          body: {
+            content: [
+              { paragraph: { elements: [{ textRun: { content: 'First para\n' } }] } },
+              { paragraph: { elements: [{ textRun: { content: 'Second para\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // A single newline is only a soft break — the two paragraphs would render
+      // as one.
+      assert.ok(text.includes('First para\n\nSecond para\n'), JSON.stringify(text));
+    });
+
+    it('separates a heading from the paragraph that follows it (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with heading',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'HEADING_1' }, elements: [{ textRun: { content: 'Section\n' } }] } },
+              { paragraph: { elements: [{ textRun: { content: 'Body\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('# Section\n\nBody\n'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('keeps consecutive list items on adjacent lines (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with list',
+          body: {
+            content: [
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'one\n' } }] } },
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'two\n' } }] } },
+            ],
+          },
+          lists: { l1: { listProperties: { nestingLevels: [{ glyphSymbol: '●' }] } } },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      // Blank lines between items would make the list loose.
+      assert.ok(res.content[0].text!.includes('- one\n- two\n'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('maps TITLE and SUBTITLE named styles to headings (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with title styles',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'TITLE' }, elements: [{ textRun: { content: 'The Title\n' } }] } },
+              { paragraph: { paragraphStyle: { namedStyleType: 'SUBTITLE' }, elements: [{ textRun: { content: 'The Subtitle\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('# The Title\n'), JSON.stringify(text));
+      assert.ok(text.includes('## The Subtitle\n'), JSON.stringify(text));
+    });
+
+    it('does not repeat the document title when the body carries the same TITLE paragraph', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Quarterly Review', revisionId: 'rev-1',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'TITLE' }, elements: [{ textRun: { content: 'Quarterly Review\n' } }] } },
+              { paragraph: { elements: [{ textRun: { content: 'Body\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.equal(text, 'revisionId: rev-1\n# Quarterly Review\n\nBody\n');
+    });
+
+    it('still prepends the document title when the body has no matching TITLE paragraph', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Real Title', revisionId: 'rev-2',
+          body: {
+            content: [
+              { paragraph: { paragraphStyle: { namedStyleType: 'TITLE' }, elements: [{ textRun: { content: 'Something else\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      assert.equal(res.content[0].text!, 'revisionId: rev-2\n# Real Title\n\n# Something else\n');
+    });
+
+    it('indents a nested item past an ordered parent marker (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with ordered nesting',
+          body: {
+            content: [
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'step one\n' } }] } },
+              { paragraph: { bullet: { listId: 'l1', nestingLevel: 1 }, elements: [{ textRun: { content: 'detail\n' } }] } },
+            ],
+          },
+          lists: {
+            l1: { listProperties: { nestingLevels: [{ glyphType: 'DECIMAL' }, { glyphSymbol: '○' }] } },
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // `1. ` is three columns wide, so a two-space indent would leave the child
+      // outside the parent item and CommonMark would render a sibling list.
+      assert.ok(text.includes('1. step one\n   - detail\n'), JSON.stringify(text));
+    });
+
+    it('pads rows so a merged header cell does not truncate body columns (format=markdown)', async () => {
+      const cell = (content: string, columnSpan?: number) => ({
+        content: [{ paragraph: { elements: [{ textRun: { content } }] } }],
+        ...(columnSpan ? { tableCellStyle: { columnSpan } } : {}),
+      });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with merged header',
+          body: {
+            content: [
+              { table: { tableRows: [
+                { tableCells: [cell('Quarterly plan', 3)] },
+                { tableCells: [cell('a'), cell('b'), cell('c')] },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // GFM sizes the table from the header: a one-column header would drop
+      // columns b and c from the rendering entirely.
+      assert.ok(text.includes('| Quarterly plan |  |  |\n| --- | --- | --- |\n| a | b | c |'), JSON.stringify(text));
+    });
+
+    it('preserves multi-paragraph table cell structure with <br> (format=markdown)', async () => {
+      const multiCell = {
+        content: [
+          { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'item one\n' } }] } },
+          { paragraph: { bullet: { listId: 'l1', nestingLevel: 0 }, elements: [{ textRun: { content: 'item two\n' } }] } },
+        ],
+      };
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with multiline cell',
+          body: {
+            content: [
+              { table: { tableRows: [{ tableCells: [multiCell, cell('other')] }] } },
+            ],
+          },
+          lists: { l1: { listProperties: { nestingLevels: [{ glyphSymbol: '●' }] } } },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // Space-joining would render "- item one - item two" with no boundary.
+      assert.ok(text.includes('| - item one<br>- item two | other |'), JSON.stringify(text));
+    });
+
+    it('does not fuse emphasis delimiters between abutting styled runs (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with abutting runs',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 're', textStyle: { bold: true } } },
+                { textRun: { content: 'ally', textStyle: { bold: true, italic: true } } },
+                { textRun: { content: '\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // Wrapping each run separately yields `**re*****ally***`, which renders as
+      // literal asterisks.
+      assert.ok(!text.includes('*****'), JSON.stringify(text));
+      assert.ok(text.includes('**re*ally***\n'), JSON.stringify(text));
+    });
+
+    it('merges runs that Docs split without a style change (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with split run',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'bold ', textStyle: { bold: true } } },
+                { textRun: { content: 'across runs', textStyle: { bold: true } } },
+                { textRun: { content: '\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      assert.ok(res.content[0].text!.includes('**bold across runs**\n'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('escapes markdown metacharacters in document text (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with metacharacters',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'a*b', textStyle: { bold: true } } },
+                { textRun: { content: ' and [1]\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      // Unescaped, the inner `*` pairs with a surrounding marker and breaks the
+      // bold span.
+      assert.ok(text.includes('**a\\*b**'), JSON.stringify(text));
+      assert.ok(text.includes('\\[1\\]'), JSON.stringify(text));
+    });
+
+    it('leaves intraword underscores unescaped (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with snake_case',
+          body: {
+            content: [
+              { paragraph: { elements: [{ textRun: { content: 'call snake_case_name now\n' } }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      // CommonMark does not treat intraword `_` as emphasis, so escaping it
+      // would only add noise.
+      assert.ok(res.content[0].text!.includes('snake_case_name'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('renders person, rich link, footnote and horizontal rule elements (format=markdown)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with inline elements',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'Owner: ' } },
+                { person: { personProperties: { name: 'Ada', email: 'ada@example.com' } } },
+                { textRun: { content: ' see ' } },
+                { richLink: { richLinkProperties: { title: 'Spec', uri: 'https://example.com/spec' } } },
+                { footnoteReference: { footnoteNumber: '1' } },
+                { textRun: { content: '\n' } },
+              ] } },
+              { paragraph: { elements: [{ horizontalRule: {} }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'markdown' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('@Ada (ada@example.com)'), JSON.stringify(text));
+      assert.ok(text.includes('[Spec](https://example.com/spec)'), JSON.stringify(text));
+      assert.ok(text.includes('[^1]'), JSON.stringify(text));
+      assert.ok(text.includes('---'), JSON.stringify(text));
+    });
+
+    it('leaves person chips out of text format', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with person',
+          body: {
+            content: [
+              { paragraph: { elements: [
+                { textRun: { content: 'Owner: ' } },
+                { person: { personProperties: { name: 'Ada', email: 'ada@example.com' } } },
+                { textRun: { content: '\n' } },
+              ] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'text' });
+      assert.equal(res.isError, false);
+      // Text output is unchanged by the markdown work.
+      assert.ok(!res.content[0].text!.includes('@Ada'), JSON.stringify(res.content[0].text!));
+    });
+
+    it('keeps tables tab-separated in text format', async () => {
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Doc with table',
+          body: {
+            content: [
+              { table: { tableRows: [{ tableCells: [cell('Owner'), cell('Role')] }] } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDoc', { documentId: 'doc-1', format: 'text' });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('Owner\tRole\t'), JSON.stringify(text));
+      assert.ok(!text.includes('|'), JSON.stringify(text));
     });
 
     it('renders inline images as a single-line placeholder (format=text)', async () => {
@@ -972,6 +1616,250 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'findAndReplaceInDoc', {});
       assert.equal(res.isError, true);
     });
+
+    it('expectedCount mismatch aborts without writing', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Hello Hello World\n' } }] } }] },
+        },
+      }));
+      const before = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length;
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-1', findText: 'Hello', replaceText: 'Hi', expectedCount: 1,
+      });
+
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /Aborted without writing.*expectedCount=1.*found 2/s);
+      assert.equal(
+        ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length, before,
+        'a failed guard must not reach batchUpdate',
+      );
+    });
+
+    it('expectedCount overshoot names substring collisions as the likely cause', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'cat catalog cathode\n' } }] } }] },
+        },
+      }));
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-1', findText: 'cat', replaceText: 'dog', expectedCount: 1,
+      });
+
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /substring collisions/);
+      assert.match(res.content[0].text!, /longer, unique findText/);
+    });
+
+    it('warns when fewer occurrences change than were verified pre-write', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Hello Hello\n' } }] } }] },
+        },
+      }));
+      // The guard sees 2, but the document is edited between the count and the
+      // write, so the API reports only 1 changed.
+      ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => ({
+        data: { replies: [{ replaceAllText: { occurrencesChanged: 1 } }] },
+      }));
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-1', findText: 'Hello', replaceText: 'Hi', expectedCount: 2,
+      });
+
+      assert.equal(res.isError, false);
+      assert.match(res.content[0].text!, /WARNING: 2 matches were verified/);
+      assert.match(res.content[0].text!, /edited concurrently/);
+    });
+
+    it('a newline-bearing replaceText compiles to delete+insert, not replaceAllText', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc', revisionId: 'rev-9',
+          body: {
+            content: [{
+              paragraph: { elements: [{ startIndex: 1, textRun: { content: 'Hello World\n' } }] },
+            }],
+          },
+        },
+      }));
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-1', findText: 'World', replaceText: 'line one\nline two',
+      });
+
+      assert.equal(res.isError, false);
+      assert.match(res.content[0].text!, /Replaced 1 occurrence/);
+
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      const requests = calls[calls.length - 1]?.args?.[0]?.requestBody?.requests;
+      assert.equal(requests.length, 2, 'one deleteContentRange plus one insertText');
+      assert.equal(requests[0].replaceAllText, undefined, 'replaceAllText mangles newlines');
+      assert.deepEqual(requests[0].deleteContentRange.range, { startIndex: 7, endIndex: 12 });
+      assert.equal(requests[1].insertText.location.index, 7);
+      assert.equal(requests[1].insertText.text, 'line one\nline two');
+    });
+
+    // The mock honours a `fields` mask with respect to revisionId, because the
+    // API does. The lock below is taken from this read, so a projection that
+    // leaves revisionId out silently unlocks the batch — and since #219 gates
+    // the stale-revision message on whether a lock was sent, it silently
+    // disables that message too. Both would regress with no test failing if
+    // the mock handed back revisionId whatever was asked for. Only revisionId
+    // is modelled; the rest of the projection is not what these tests check.
+    function suppliesRevisionId(fields: unknown): boolean {
+      if (typeof fields !== 'string' || fields.trim() === '') return true;
+      return /(^|[(,\s])revisionId([),\s]|$)/.test(fields);
+    }
+
+    function docWithRevisionAndMatch(documentId: string, revisionId?: string) {
+      ctx.mocks.docs.service.documents.get._setImpl(async (params: any) => ({
+        data: {
+          documentId, title: 'My Doc',
+          ...(revisionId && suppliesRevisionId(params?.fields) ? { revisionId } : {}),
+          body: {
+            content: [{
+              paragraph: { elements: [{ startIndex: 1, textRun: { content: 'Hello World\n' } }] },
+            }],
+          },
+        },
+      }));
+    }
+
+    it('pins the multi-line batch to the revision it located against', async () => {
+      docWithRevisionAndMatch('doc-pin', 'rev-9');
+
+      await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-pin', findText: 'World', replaceText: 'a\nb',
+      });
+      let calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.deepEqual(calls[calls.length - 1]?.args?.[0]?.requestBody.writeControl, { requiredRevisionId: 'rev-9' });
+
+      await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-pin', findText: 'World', replaceText: 'a\nb', ifRevisionId: 'rev-caller',
+      });
+      calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.deepEqual(calls[calls.length - 1]?.args?.[0]?.requestBody.writeControl, { requiredRevisionId: 'rev-caller' });
+    });
+
+    it('sends no writeControl when the locating read has no revisionId', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-no-rev', title: 'My Doc',
+          body: {
+            content: [{
+              paragraph: { elements: [{ startIndex: 1, textRun: { content: 'Hello World\n' } }] },
+            }],
+          },
+        },
+      }));
+
+      await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-no-rev', findText: 'World', replaceText: 'a\nb',
+      });
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      const writeControl = calls[calls.length - 1]?.args?.[0]?.requestBody.writeControl;
+      assert.equal(writeControl, undefined, 'no revisionId to lock against means no writeControl at all, not { requiredRevisionId: undefined }');
+    });
+
+    it('maps a stale-revision batchUpdate failure to a message telling the caller to re-read and retry', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-stale', title: 'My Doc', revisionId: 'rev-9',
+          body: {
+            content: [{
+              paragraph: { elements: [{ startIndex: 1, textRun: { content: 'Hello World\n' } }] },
+            }],
+          },
+        },
+      }));
+      ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => {
+        throw Object.assign(
+          new Error("The provided revision doesn't match the document's current revision."),
+          { status: 400 },
+        );
+      });
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-stale', findText: 'World', replaceText: 'a\nb',
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /document changed between the read and the write/);
+      assert.match(res.content[0].text!, /[Rr]e-read the document and retry/);
+
+      ctx.mocks.docs.service.documents.batchUpdate._resetImpl();
+    });
+
+    // The mapping above rewrites the API's own explanation, so it has to fire
+    // on exactly the failure it explains. Google documents the 400 for a
+    // requiredRevisionId mismatch but not its message text, so the condition
+    // is "this write carried a lock", not "the message mentions a revision".
+    // These two cases pin both sides of it; without them the handler could map
+    // every 400 to a revision mismatch and nothing would fail.
+    it('keeps the API message when it maps a stale-revision failure', async () => {
+      docWithRevisionAndMatch('doc-keep', 'rev-9');
+      ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => {
+        throw Object.assign(new Error('Some specific reason from Google.'), { status: 400 });
+      });
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-keep', findText: 'World', replaceText: 'a\nb',
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /document changed between the read and the write/);
+      // A 400 from some other cause is still mapped, because the lock is the
+      // only reliable signal — so the original text must survive for it to be
+      // diagnosable at all.
+      assert.match(res.content[0].text!, /Some specific reason from Google\./);
+
+      ctx.mocks.docs.service.documents.batchUpdate._resetImpl();
+    });
+
+    it('passes a 400 through unmapped when the write carried no lock', async () => {
+      // No revisionId on the read and no ifRevisionId from the caller means no
+      // writeControl was sent, so a 400 cannot be the lock failing.
+      docWithRevisionAndMatch('doc-nolock', undefined);
+      ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => {
+        throw Object.assign(new Error('Invalid requests[0]: bad index.'), { status: 400 });
+      });
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-nolock', findText: 'World', replaceText: 'a\nb',
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /Invalid requests\[0\]: bad index\./);
+      assert.doesNotMatch(res.content[0].text!, /revision mismatch/);
+
+      ctx.mocks.docs.service.documents.batchUpdate._resetImpl();
+    });
+
+    it('passes a non-400 failure through unmapped even when the write carried a lock', async () => {
+      docWithRevisionAndMatch('doc-403', 'rev-9');
+      ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => {
+        throw Object.assign(new Error('The caller does not have permission.'), { status: 403 });
+      });
+
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-403', findText: 'World', replaceText: 'a\nb',
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /does not have permission/);
+      assert.doesNotMatch(res.content[0].text!, /revision mismatch/);
+
+      ctx.mocks.docs.service.documents.batchUpdate._resetImpl();
+    });
+
+    it('refuses a multi-line findText rather than silently mismatching', async () => {
+      const res = await callTool(ctx.client, 'findAndReplaceInDoc', {
+        documentId: 'doc-1', findText: 'a\nb', replaceText: 'x\ny',
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0].text!, /Multi-line findText is not supported/);
+    });
   });
 
   // --- listComments ---
@@ -1039,23 +1927,110 @@ describe('Docs tools', () => {
 
   // --- addComment ---
   describe('addComment', () => {
-    it('happy path', async () => {
-      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
-        data: {
-          documentId: 'doc-1', title: 'My Doc',
-          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Hello World\n' }, startIndex: 1, endIndex: 13 }] } }] },
-        },
-      }));
+    const flatDoc = () => ({
+      documentId: 'doc-1', title: 'My Doc',
+      body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Hello World\n' }, startIndex: 1, endIndex: 13 }] } }] },
+    });
+
+    it('happy path: quotes the range and sends NO anchor', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: flatDoc() }));
       const res = await callTool(ctx.client, 'addComment', {
-        documentId: 'doc-1', startIndex: 1, endIndex: 5, commentText: 'Great!',
+        documentId: 'doc-1', startIndex: 1, endIndex: 6, commentText: 'Great!',
       });
       assert.equal(res.isError, false);
       assert.ok(res.content[0].text!.includes('Comment added'));
+
+      const body = ctx.mocks.drive.tracker.getCalls('comments.create').at(-1)?.args?.[0]?.requestBody;
+      assert.equal(body.quotedFileContent.value, 'Hello');
+      assert.equal(body.quotedFileContent.mimeType, 'text/plain');
+      // The anchor Docs cannot resolve is what made the editor render these
+      // threads as "Original content was deleted". It must not come back.
+      assert.ok(!('anchor' in body), 'addComment must not send an anchor');
+    });
+
+    it('targets by textToFind and quotes the requested instance', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc',
+          body: { content: [{ paragraph: { elements: [{ textRun: { content: 'target and target again\n' }, startIndex: 1, endIndex: 25 }] } }] },
+        },
+      }));
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', textToFind: 'target', matchInstance: 2, commentText: 'second one',
+      });
+      assert.equal(res.isError, false);
+      const body = ctx.mocks.drive.tracker.getCalls('comments.create').at(-1)?.args?.[0]?.requestBody;
+      assert.equal(body.quotedFileContent.value, 'target');
+      assert.ok(res.content[0].text!.includes('[12-18]'));
+    });
+
+    it('quotes text inside a table', async () => {
+      // The previous implementation scanned only top-level body paragraphs, so
+      // a range inside a table quoted '' and the comment lost its passage.
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'My Doc',
+          body: {
+            content: [{
+              table: {
+                tableRows: [{
+                  tableCells: [{
+                    content: [{ paragraph: { elements: [{ textRun: { content: 'CellText\n' }, startIndex: 5, endIndex: 14 }] } }],
+                  }],
+                }],
+              },
+            }],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', startIndex: 5, endIndex: 9, commentText: 'about this cell',
+      });
+      assert.equal(res.isError, false);
+      const body = ctx.mocks.drive.tracker.getCalls('comments.create').at(-1)?.args?.[0]?.requestBody;
+      assert.equal(body.quotedFileContent.value, 'Cell');
+    });
+
+    it('quotes from the requested tab in a multi-tab document', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: mockDocs.multiTab() }));
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', tabId: 'tab-2', startIndex: 1, endIndex: 7, commentText: 'on tab 2',
+      });
+      assert.equal(res.isError, false);
+      const body = ctx.mocks.drive.tracker.getCalls('comments.create').at(-1)?.args?.[0]?.requestBody;
+      // Index spaces are per-tab: [1-7) is 'Second' in tab-2, 'First ' in tab-1.
+      assert.equal(body.quotedFileContent.value, 'Second');
+    });
+
+    it('rejects a range that covers no text instead of commenting on nothing', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: flatDoc() }));
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', startIndex: 500, endIndex: 520, commentText: 'nowhere',
+      });
+      assert.equal(res.isError, true);
+      assert.ok(res.content[0].text!.includes('covers no text'));
+      assert.equal(ctx.mocks.drive.tracker.getCalls('comments.create').length, 0);
+    });
+
+    it('reports when textToFind is absent', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: flatDoc() }));
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', textToFind: 'nonexistent', commentText: 'x',
+      });
+      assert.equal(res.isError, true);
+      assert.equal(ctx.mocks.drive.tracker.getCalls('comments.create').length, 0);
     });
 
     it('validation: endIndex must be > startIndex', async () => {
       const res = await callTool(ctx.client, 'addComment', {
         documentId: 'doc-1', startIndex: 5, endIndex: 2, commentText: 'test',
+      });
+      assert.equal(res.isError, true);
+    });
+
+    it('validation: requires indices or textToFind', async () => {
+      const res = await callTool(ctx.client, 'addComment', {
+        documentId: 'doc-1', commentText: 'no target',
       });
       assert.equal(res.isError, true);
     });
@@ -1091,8 +2066,8 @@ describe('Docs tools', () => {
       }));
       const res = await callTool(ctx.client, 'getGoogleDocContent', { documentId: 'doc-1' });
       assert.equal(res.isError, false);
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 ==='));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab2 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 (tabId=tab-1) ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab2 (tabId=tab-2) ==='));
       assert.ok(res.content[0].text!.includes('First tab'));
       assert.ok(res.content[0].text!.includes('Second tab'));
     });
@@ -1104,15 +2079,15 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'getGoogleDocContent', { documentId: 'doc-1' });
       assert.equal(res.isError, false);
       // Should include all tabs with proper hierarchy
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 (tabId=tab-1) ==='));
       assert.ok(res.content[0].text!.includes('First tab'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.1 (tabId=tab-1-1) ==='));
       assert.ok(res.content[0].text!.includes('First child'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2 (tabId=tab-1-2) ==='));
       assert.ok(res.content[0].text!.includes('Second child'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2.1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2.1 (tabId=tab-1-2-1) ==='));
       assert.ok(res.content[0].text!.includes('First grandchild'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab2 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab2 (tabId=tab-2) ==='));
       assert.ok(res.content[0].text!.includes('Second tab'));
     });
 
@@ -1123,13 +2098,13 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'getGoogleDocContent', { documentId: 'doc-1' });
       assert.equal(res.isError, false);
       // Should include all tabs with proper hierarchy
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1 (tabId=tab-1) ==='));
       assert.ok(res.content[0].text!.includes('First tab'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.1 (tabId=tab-1-1) ==='));
       assert.ok(res.content[0].text!.includes('First child'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2 (tabId=tab-1-2) ==='));
       assert.ok(res.content[0].text!.includes('Second child'));
-      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2.1 ==='));
+      assert.ok(res.content[0].text!.includes('=== Tab: Tab1.2.1 (tabId=tab-1-2-1) ==='));
       assert.ok(res.content[0].text!.includes('First grandchild'));
     });
 
@@ -1226,6 +2201,50 @@ describe('Docs tools', () => {
       assert.ok(text.includes('Normal text'), 'should still include text content');
     });
 
+    it('surfaces superscript/subscript runs on the formatted read path', async () => {
+      // Without this, text written by applyTextStyle({ baselineOffset })
+      // reads back indistinguishable from unformatted text.
+      const styledRun = (content: string, baselineOffset: string, startIndex: number, endIndex: number) => ({
+        textRun: { content, textStyle: { baselineOffset } },
+        startIndex,
+        endIndex,
+      });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          title: 'Baseline Doc',
+          tabs: [
+            {
+              tabProperties: { title: 'Main' },
+              documentTab: {
+                body: {
+                  content: [{
+                    paragraph: {
+                      elements: [
+                        styledRun('E = mc\n', 'NONE', 1, 8),
+                        styledRun('2\n', 'SUPERSCRIPT', 8, 10),
+                        styledRun('H2O\n', 'SUBSCRIPT', 10, 14),
+                      ],
+                    },
+                  }],
+                },
+              },
+            },
+          ],
+        },
+      }));
+      const res = await callTool(ctx.client, 'getGoogleDocContent', { documentId: 'doc-1', includeFormatting: true });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text!;
+      assert.ok(text.includes('baseline=superscript'), 'should mark the superscript run');
+      assert.ok(text.includes('baseline=subscript'), 'should mark the subscript run');
+      // NONE is what the API reports for ordinary text; emitting it would force
+      // a meta line onto every unformatted run.
+      assert.ok(!text.includes('baseline=none'), 'should not mark normal-baseline runs');
+      const normalLine = text.split('\n').find((l) => l.includes('E = mc'))!;
+      assert.ok(!normalLine.includes('baseline='), 'normal run should carry no baseline marker');
+    });
+
     it('includes formatting with multi-tab', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({
         data: {
@@ -1276,6 +2295,8 @@ describe('Docs tools', () => {
       const res = await callTool(ctx.client, 'getGoogleDocContent', { documentId: 'doc-1', includeFormatting: true });
       assert.equal(res.isError, false);
       const text = res.content[0].text!;
+      // This fixture's tabProperties carry no tabId, so the header advertises
+      // none — the id is only printed when there is one to pass to editTableCell.
       assert.ok(text.includes('=== Tab: Tab1 ==='), 'should have tab headers');
       assert.ok(text.includes('=== Tab: Tab2 ==='), 'should have tab headers');
       assert.ok(text.includes('style=italic'), 'should show italic in Tab1');
@@ -1991,7 +3012,7 @@ describe('Docs tools', () => {
       let requestedUrl = '';
       ctx.setAuthRequest(async (opts: any) => {
         requestedUrl = opts.url;
-        return { data: pngArrayBuffer(), headers: { 'content-type': 'image/png' } };
+        return { data: pngArrayBuffer(), headers: new Headers({ 'content-type': 'image/png' }) };
       });
       const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-1' });
       assert.equal(res.isError, false);
@@ -2003,15 +3024,26 @@ describe('Docs tools', () => {
 
     it('strips charset from the content-type header', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: imageDocData }));
-      ctx.setAuthRequest(async () => ({ data: pngArrayBuffer(), headers: { 'content-type': 'image/jpeg; charset=binary' } }));
+      ctx.setAuthRequest(async () => ({ data: pngArrayBuffer(), headers: new Headers({ 'content-type': 'image/jpeg; charset=binary' }) }));
       const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-1' });
       assert.equal(res.isError, false);
       assert.equal(res.content[0].mimeType, 'image/jpeg');
     });
 
+    // gaxios 7 returns a Headers instance (see test/gaxios-contract.test.ts); the
+    // doubles above use it. This one keeps the legacy plain-object shape covered,
+    // since getResponseHeader() accepts both.
+    it('reads a plain-object content-type header (pre-gaxios-7 shape)', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: imageDocData }));
+      ctx.setAuthRequest(async () => ({ data: pngArrayBuffer(), headers: { 'content-type': 'image/gif' } }));
+      const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-1' });
+      assert.equal(res.isError, false);
+      assert.equal(res.content[0].mimeType, 'image/gif');
+    });
+
     it('returns a base64 JSON envelope when outputFormat=base64', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: imageDocData }));
-      ctx.setAuthRequest(async () => ({ data: pngArrayBuffer(), headers: { 'content-type': 'image/png' } }));
+      ctx.setAuthRequest(async () => ({ data: pngArrayBuffer(), headers: new Headers({ 'content-type': 'image/png' }) }));
       const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-1', outputFormat: 'base64' });
       assert.equal(res.isError, false);
       assert.equal(res.content[0].type, 'text');
@@ -2047,7 +3079,7 @@ describe('Docs tools', () => {
       let requestedUrl = '';
       ctx.setAuthRequest(async (opts: any) => {
         requestedUrl = opts.url;
-        return { data: pngArrayBuffer(), headers: { 'content-type': 'image/png' } };
+        return { data: pngArrayBuffer(), headers: new Headers({ 'content-type': 'image/png' }) };
       });
       const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-2' });
       assert.equal(res.isError, false);
@@ -2100,7 +3132,7 @@ describe('Docs tools', () => {
     it('reports a non-contradictory decimal size when the image exceeds the 40 MB cap', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: imageDocData }));
       const oversized = new Uint8Array(42257613).buffer; // ~40.3 MB, just over the 40 MB cap
-      ctx.setAuthRequest(async () => ({ data: oversized, headers: { 'content-type': 'image/png' } }));
+      ctx.setAuthRequest(async () => ({ data: oversized, headers: new Headers({ 'content-type': 'image/png' }) }));
       const res = await callTool(ctx.client, 'getGoogleDocImage', { documentId: 'doc-1', inlineObjectId: 'obj-1' });
       assert.equal(res.isError, true);
       const text = res.content[0].text!;
@@ -2160,6 +3192,54 @@ describe('Docs tools', () => {
       assert.ok(r.outputLength > r.documentLength, 'outputLength includes the title prefix, documentLength does not');
     });
 
+    it('does not split a markdown table across pages', async () => {
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Paged',
+          body: {
+            content: [
+              { paragraph: { elements: [{ textRun: { content: 'Intro paragraph\n' } }] } },
+              { table: { tableRows: [
+                { tableCells: [cell('Owner'), cell('Role')] },
+                { tableCells: [cell('Eero'), cell('CEO')] },
+              ] } },
+            ],
+          },
+        },
+      }));
+      // A limit that lands between the header row and the separator row.
+      const first = await callTool(ctx.client, 'readGoogleDocPaginated', { documentId: 'doc-1', format: 'markdown', offset: 0, limit: 50 });
+      const p1 = JSON.parse(first.content[0].text!);
+      // The whole table moves to the next page rather than leaving a headerless
+      // fragment behind.
+      assert.ok(!p1.content.includes('|'), JSON.stringify(p1.content));
+      assert.equal(p1.hasMore, true);
+
+      const second = await callTool(ctx.client, 'readGoogleDocPaginated', { documentId: 'doc-1', format: 'markdown', offset: p1.nextOffset, limit: 50 });
+      const p2 = JSON.parse(second.content[0].text!);
+      assert.ok(p2.content.includes('| Owner | Role |\n| --- | --- |\n| Eero | CEO |'), JSON.stringify(p2.content));
+    });
+
+    it('still advances when a single table is larger than the page limit', async () => {
+      const cell = (content: string) => ({ content: [{ paragraph: { elements: [{ textRun: { content } }] } }] });
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'T',
+          body: {
+            content: [
+              { table: { tableRows: Array.from({ length: 8 }, (_, i) => ({ tableCells: [cell(`row ${i}`), cell('value')] })) } },
+            ],
+          },
+        },
+      }));
+      const res = await callTool(ctx.client, 'readGoogleDocPaginated', { documentId: 'doc-1', format: 'markdown', offset: 0, limit: 40 });
+      const r = JSON.parse(res.content[0].text!);
+      // No forward progress would be an infinite pagination loop.
+      assert.ok(r.nextOffset > 0, JSON.stringify(r));
+      assert.ok(r.content.length > 0, JSON.stringify(r));
+    });
+
     it('reads a specific tab by tabId', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: mockDocs.multiTab() }));
       const res = await callTool(ctx.client, 'readGoogleDocPaginated', { documentId: 'doc-1', tabId: 'tab-2', offset: 0, limit: 50000 });
@@ -2199,6 +3279,55 @@ describe('Docs tools', () => {
     const oneLongLine = () => ({
       documentId: 'doc-1', title: 'One Long Line',
       body: { content: [{ paragraph: { elements: [{ textRun: { content: 'Q'.repeat(200) + '\n' }, startIndex: 1, endIndex: 202 }] } }] },
+    });
+
+    it('never splits a page inside a table rendering', async () => {
+      // Table rows are bare `| ... |` lines with no index of their own. A page
+      // break between the <table ...> header and its rows opens the next page
+      // with `| gamma | delta |` and nothing saying which table that is.
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1', title: 'Table Doc',
+          body: { content: [
+            { paragraph: { elements: [{ textRun: { content: 'Intro\n' }, startIndex: 1, endIndex: 7 }] } },
+            {
+              startIndex: 7, endIndex: 20,
+              table: { tableRows: [{ tableCells: [
+                { content: [{ paragraph: { elements: [{ textRun: { content: 'gamma\n' }, startIndex: 9, endIndex: 15 }] } }] },
+                { content: [{ paragraph: { elements: [{ textRun: { content: 'delta\n' }, startIndex: 16, endIndex: 22 }] } }] },
+              ] }] },
+            },
+          ] },
+        },
+      }));
+
+      // Walk every page boundary a caller could land on. Two invariants: a page
+      // never ends on a table header with its rows pushed to the next page, and
+      // when the whole block fits in the limit it is never split at all. A block
+      // longer than the limit still takes a hard cut, so pagination advances.
+      for (const limit of [40, 60, 100, 140, 172, 175, 190, 200, 300]) {
+        let offset = 0;
+        for (let page = 0; page < 30; page++) {
+          const res = await callTool(ctx.client, 'getGoogleDocContentPaginated', {
+            documentId: 'doc-1', offset, limit,
+          });
+          const r = JSON.parse(res.content[0].text!);
+          // A page that ends right after a COMPLETE header line is the bad cut:
+          // the next page then opens with bare `| a | b |` rows. A header split
+          // mid-line is just ordinary long-line pagination and is fine.
+          assert.ok(!/(^|\n)\[\d+-\d+\] <table[^\n]*\n$/.test(r.content),
+            `limit=${limit}: page ends on a complete table header, orphaning its rows`);
+
+          if (limit >= 300 && /\| gamma /.test(r.content)) {
+            assert.match(r.content, /<table/, `limit=${limit}: rows without their header`);
+            assert.match(r.content, /cells: r0c0/, `limit=${limit}: rows without their cell map`);
+          }
+
+          if (!r.hasMore) break;
+          assert.ok(r.nextOffset > offset, 'pagination must advance');
+          offset = r.nextOffset;
+        }
+      }
     });
 
     it('returns indexed content with hasMore and nextOffset', async () => {
@@ -2559,6 +3688,29 @@ describe('Docs tools', () => {
         assert.equal(req.textStyle.baselineOffset, 'NONE');
         assert.ok(req.fields.split(',').includes('baselineOffset'));
       });
+
+      it('appends baselineOffset to the field mask alongside other style options', async () => {
+        // Guards the append path: with a single style option the mask is a
+        // one-element string, so an overwriting mask builder would look correct.
+        const res = await callTool(ctx.client, 'applyTextStyle', {
+          documentId: 'doc-1', startIndex: 1, endIndex: 5, bold: true, baselineOffset: 'SUPERSCRIPT',
+        });
+        assert.equal(res.isError, false);
+        const req = lastRequests()[0].updateTextStyle;
+        assert.equal(req.textStyle.bold, true);
+        assert.equal(req.textStyle.baselineOffset, 'SUPERSCRIPT');
+        assert.deepEqual(req.fields.split(',').sort(), ['baselineOffset', 'bold']);
+      });
+
+      it('accepts baselineOffset through the formatGoogleDocText alias', async () => {
+        const res = await callTool(ctx.client, 'formatGoogleDocText', {
+          documentId: 'doc-1', startIndex: 1, endIndex: 5, baselineOffset: 'SUPERSCRIPT',
+        });
+        assert.equal(res.isError, false);
+        const req = lastRequests()[0].updateTextStyle;
+        assert.equal(req.textStyle.baselineOffset, 'SUPERSCRIPT');
+        assert.ok(req.fields.split(',').includes('baselineOffset'));
+      });
     });
 
     describe('applyParagraphStyle', () => {
@@ -2691,6 +3843,153 @@ describe('Docs tools', () => {
         assert.ok(res.content[0].text!.includes('Tab with ID "missing" not found'));
         assert.equal(ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length, before);
         ctx.mocks.docs.service.documents.get._resetImpl();
+      });
+    });
+  });
+  // -------------------------------------------------------------------------
+  // Style reads
+  // -------------------------------------------------------------------------
+  describe('style reads', () => {
+    const para = (startIndex: number, endIndex: number, text: string, paragraphStyle: any = {}) => ({
+      startIndex,
+      endIndex,
+      paragraph: { paragraphStyle, elements: [{ startIndex, endIndex, textRun: { content: text, textStyle: {} } }] },
+    });
+    const RULE = { width: { magnitude: 1, unit: 'PT' }, dashStyle: 'SOLID' };
+
+    // A header and a footer each restart indices at 0, separate from the body.
+    // A walk that merged them answered describeGoogleDocRange(startIndex=1) with
+    // three paragraphs carrying overlapping ranges and nothing to tell the
+    // caller which one an index-taking write should target.
+    const withHeaderAndFooter = () => ({
+      documentId: 'doc-1',
+      title: 'Report',
+      revisionId: 'rev-9',
+      body: { content: [para(1, 11, 'Body copy\n', { namedStyleType: 'NORMAL_TEXT' })] },
+      headers: { 'h.1': { content: [para(0, 12, 'Header text\n', { namedStyleType: 'NORMAL_TEXT' })] } },
+      footers: { 'f.1': { content: [para(0, 7, 'Footer\n', { namedStyleType: 'NORMAL_TEXT', alignment: 'CENTER' })] } },
+    });
+
+    const twoTabs = () => ({
+      documentId: 'doc-1',
+      title: 'Two Tabs',
+      revisionId: 'rev-9',
+      tabs: [
+        { tabProperties: { tabId: 'tab-1', title: 'Overview' }, documentTab: { body: { content: [para(1, 9, 'First\n', { namedStyleType: 'HEADING_1', borderBottom: RULE })] } } },
+        { tabProperties: { tabId: 'tab-2', title: 'Appendix' }, documentTab: { body: { content: [para(1, 9, 'Second\n', { namedStyleType: 'HEADING_2', borderBottom: RULE })] } } },
+      ],
+    });
+
+    afterEach(() => ctx.mocks.docs.service.documents.get._resetImpl());
+
+    describe('describeGoogleDocRange', () => {
+      it('describes the body only, never the header or footer index space', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: withHeaderAndFooter() }));
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1 });
+        assert.equal(res.isError, false);
+        const text = res.content[0].text!;
+        assert.ok(text.includes('paragraph [1-11]'));
+        assert.equal(text.includes('Header text'), false);
+        assert.equal(text.includes('Footer'), false);
+        // One paragraph reported, not three.
+        assert.equal((text.match(/^paragraph \[/gm) ?? []).length, 1);
+      });
+
+      it('defaults to the first tab and reports only that tab on a two-tab document', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: twoTabs() }));
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1, endIndex: 3 });
+        assert.equal(res.isError, false);
+        const text = res.content[0].text!;
+        // Both tabs hold a paragraph at [1-9]; reporting both would print two
+        // identical ranges with nothing to choose between them.
+        assert.equal((text.match(/^paragraph \[/gm) ?? []).length, 1);
+        assert.ok(text.includes('HEADING_1'));
+        assert.equal(text.includes('HEADING_2'), false);
+      });
+
+      it('probes the named tab when given one', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: twoTabs() }));
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1, tabId: 'tab-2' });
+        assert.equal(res.isError, false);
+        assert.ok(res.content[0].text!.includes('HEADING_2'));
+      });
+
+      it('reports the revisionId from the same fetch the indices came from', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: withHeaderAndFooter() }));
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1 });
+        assert.ok(res.content[0].text!.startsWith('revisionId: rev-9\n'));
+        // One read, not one for the range and another for the lock.
+        assert.equal(ctx.mocks.docs.tracker.getCalls('documents.get').length, 1);
+      });
+
+      it('says the lock is unavailable rather than printing undefined', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => {
+          const d: any = withHeaderAndFooter();
+          delete d.revisionId;
+          return { data: d };
+        });
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1 });
+        assert.ok(res.content[0].text!.includes('revisionId: unavailable (no edit access)'));
+      });
+
+      it('refuses mixed targeting instead of silently ignoring endIndex', async () => {
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', textToFind: 'Body', endIndex: 5 });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('not both'));
+      });
+
+      it('refuses an endIndex that is not past startIndex', async () => {
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 5, endIndex: 5 });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('endIndex must be greater than startIndex'));
+      });
+
+      it('requires a targeting mode', async () => {
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1' });
+        assert.equal(res.isError, true);
+      });
+
+      it('returns the standard not-found error for an unknown tabId', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: twoTabs() }));
+        const res = await callTool(ctx.client, 'describeGoogleDocRange', { documentId: 'doc-1', startIndex: 1, tabId: 'missing' });
+        assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.includes('Tab with ID "missing" not found'));
+      });
+    });
+
+    describe('getGoogleDocStyleSummary', () => {
+      it('summarizes the body only, never the header or footer index space', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: withHeaderAndFooter() }));
+        const res = await callTool(ctx.client, 'getGoogleDocStyleSummary', { documentId: 'doc-1' });
+        assert.equal(res.isError, false);
+        // Body holds one paragraph; the header and footer add two more that
+        // would be counted by a merged walk.
+        assert.ok(res.content[0].text!.includes('paragraphs: 1 '));
+      });
+
+      it('prefixes locations with the tab title across tabs and keeps counts whole-document', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: twoTabs() }));
+        const res = await callTool(ctx.client, 'getGoogleDocStyleSummary', { documentId: 'doc-1' });
+        const text = res.content[0].text!;
+        assert.ok(text.includes('paragraphs: 2 '));
+        assert.ok(text.includes('bordered paragraphs: 2 (at Overview:1, Appendix:1)'));
+      });
+
+      it('summarizes one tab when given a tabId, without tab prefixes', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: twoTabs() }));
+        const res = await callTool(ctx.client, 'getGoogleDocStyleSummary', { documentId: 'doc-1', tabId: 'tab-2' });
+        const text = res.content[0].text!;
+        assert.ok(text.includes('paragraphs: 1 '));
+        assert.ok(text.includes('bordered paragraphs: 1 (at 1)'));
+        assert.equal(text.includes('Appendix:'), false);
+      });
+
+      it('reports the title and the revisionId', async () => {
+        ctx.mocks.docs.service.documents.get._setImpl(async () => ({ data: withHeaderAndFooter() }));
+        const res = await callTool(ctx.client, 'getGoogleDocStyleSummary', { documentId: 'doc-1' });
+        const text = res.content[0].text!;
+        assert.ok(text.includes('Style summary for "Report"'));
+        assert.ok(text.includes('revisionId: rev-9'));
       });
     });
   });

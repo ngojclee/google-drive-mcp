@@ -9,13 +9,15 @@ import pdfLib from 'pdf-lib';
 const { PDFDocument } = pdfLib;
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
 import { errorResponse } from '../types.js';
-import { escapeDriveQuery, getMimeTypeFromFilename, isTextMime, TEXT_MIME_TYPES, ALL_DRIVES_LIST_PARAMS, PARENT_SCOPED_LIST_PARAMS } from '../utils.js';
+import { escapeDriveQuery, getMimeTypeFromFilename, isTextMime, TEXT_MIME_TYPES, ALL_DRIVES_LIST_PARAMS, PARENT_SCOPED_LIST_PARAMS, DRIVE_ORDER_BY_VALUES } from '../utils.js';
 import { downloadTextContent } from './text-content.js';
+import { toNodeReadable } from '../utils/streams.js';
 import { downloadDriveFile, GOOGLE_WORKSPACE_EXPORT_FORMATS } from '../download-file.js';
 import { getSecureTokenPath } from '../auth/utils.js';
 import { SCOPE_ALIASES, SCOPE_PRESETS, resolveOAuthScopes, splitScopes } from '../auth/scopes.js';
 import { getActiveAuthMode, describeBypassedTokens, AUTH_MODE_OVERRIDE_ENV_VARS, type ActiveAuthMode } from '../auth/externalAuth.js';
 import { getEffectiveIdentity } from '../auth/identity.js';
+import { withRetry, UPLOAD_TIMEOUT_MS } from '../utils/retry.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,6 +51,8 @@ const SearchSchema = z.object({
   pageSize: z.number().int().min(1).max(100).optional(),
   pageToken: z.string().optional(),
   rawQuery: z.boolean().optional(),
+  orderBy: z.enum(DRIVE_ORDER_BY_VALUES).optional().default("modifiedTime desc")
+    .describe("Sort order for results."),
 });
 
 const CreateTextFileSchema = z.object({
@@ -361,7 +365,7 @@ export function computeAuthStatus(input: {
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: "search",
-    description: "Search for files in Google Drive. Set rawQuery=true to pass a raw Google Drive API query supporting operators like modifiedTime, createdTime, mimeType, name contains, etc.",
+    description: "Search for files in Google Drive. Results are sorted most-recently-modified first by default; use orderBy for a different order. Set rawQuery=true to pass a raw Google Drive API query supporting operators like modifiedTime, createdTime, mimeType, name contains, etc.",
     inputSchema: {
       type: "object",
       properties: {
@@ -369,6 +373,7 @@ export const toolDefinitions: ToolDefinition[] = [
         pageSize: { type: "number", description: "Results per page (default 50, max 100)" },
         pageToken: { type: "string", description: "Token for next page of results" },
         rawQuery: { type: "boolean", description: "If true, pass query directly to Google Drive API without wrapping in fullText contains. Enables date filters, mimeType filters, etc." },
+        orderBy: { type: "string", description: "Sort order for results. Keys without 'desc' sort ascending, so 'modifiedTime' is oldest-first. When paging, repeat the same value on every pageToken call.", enum: [...DRIVE_ORDER_BY_VALUES], default: "modifiedTime desc" },
       },
       required: ["query"],
     },
@@ -544,7 +549,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "addPermission",
-    description: "Add a sharing permission to a file. Provide emailAddress for type 'user'/'group', domain for type 'domain', and neither for 'anyone'.",
+    description: "Add a sharing permission to a file. If the principal already holds a permission on the file, Drive updates that permission instead of creating a second one, and the requested role is applied even when it is a downgrade (asking for 'reader' for an existing 'writer' leaves them as 'reader'). Provide emailAddress for type 'user'/'group', domain for type 'domain', and neither for 'anyone'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -588,7 +593,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "shareFile",
-    description: "Convenience wrapper to share a file with a user email",
+    description: "Convenience wrapper to share a file with a user email. If the user already holds a permission on the file, that permission's role is set to the requested one (even when it is a downgrade) instead of creating a duplicate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -773,6 +778,65 @@ export const toolDefinitions: ToolDefinition[] = [
 // Handler
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Permission writes
+// ---------------------------------------------------------------------------
+// Drive can apply a different role than the one requested: `permissions.create`
+// upserts onto a permission the principal already holds, and the resulting role
+// is not always the requested one. Every permission write below compares the
+// role Drive returned against the request and never reports the request as
+// the result.
+
+function describeRole(role: string | null | undefined): string {
+  return role ? `'${role}'` : 'no role';
+}
+
+type PermissionRoleOutcome =
+  | { ok: true; role: string; corrected: false }
+  | { ok: true; role: string; corrected: true; initiallyApplied: string | null }
+  | { ok: false; detail: string };
+
+/**
+ * Reconcile the role Drive applied on a `permissions.create` with the role
+ * requested. On a mismatch, issue one corrective `permissions.update` and
+ * report what happened: success with the role Drive first applied (so the
+ * caller learns an existing permission was changed, including a downgrade),
+ * or a failure describing what Drive holds now.
+ */
+async function reconcileCreatedPermissionRole(
+  ctx: ToolContext,
+  drive: drive_v3.Drive,
+  fileId: string,
+  created: drive_v3.Schema$Permission,
+  requestedRole: string,
+): Promise<PermissionRoleOutcome> {
+  if (created.role === requestedRole) return { ok: true, role: requestedRole, corrected: false };
+  const applied = describeRole(created.role);
+  if (!created.id) {
+    return { ok: false, detail: `requested '${requestedRole}' but Drive applied ${applied} and returned no permission id to correct` };
+  }
+  try {
+    const corrected = await withRetry(
+      (signal) => drive.permissions.update({
+        fileId,
+        permissionId: created.id!,
+        requestBody: { role: requestedRole },
+        fields: 'id,role',
+        supportsAllDrives: true,
+      }, { signal }),
+      { ...ctx.runtimeConfig, retryMax: 0 },
+      'drive.permissions.update(reconcile)',
+      ctx.log
+    );
+    if (corrected.data.role === requestedRole) {
+      return { ok: true, role: requestedRole, corrected: true, initiallyApplied: created.role ?? null };
+    }
+    return { ok: false, detail: `requested '${requestedRole}' but Drive holds ${describeRole(corrected.data.role)} even after a corrective update` };
+  } catch (e: unknown) {
+    return { ok: false, detail: `requested '${requestedRole}' but Drive applied ${applied}, and the corrective update failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
 export async function handleTool(
   toolName: string,
   args: Record<string, unknown>,
@@ -785,7 +849,7 @@ export async function handleTool(
       if (!validation.success) {
         return errorResponse(validation.error.errors[0].message);
       }
-      const { query: userQuery, pageSize, pageToken, rawQuery } = validation.data;
+      const { query: userQuery, pageSize, pageToken, rawQuery, orderBy } = validation.data;
 
       let formattedQuery: string;
       if (rawQuery) {
@@ -798,13 +862,19 @@ export async function handleTool(
         formattedQuery = `fullText contains '${escapedQuery}' and trashed = false`;
       }
 
-      const res = await ctx.getDrive().files.list({
-        q: formattedQuery,
-        pageSize: Math.min(pageSize || 50, 100),
-        pageToken: pageToken,
-        fields: "nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, size, parents)",
-        ...ALL_DRIVES_LIST_PARAMS
-      });
+      const res = await withRetry(
+        (signal) => ctx.getDrive().files.list({
+          q: formattedQuery,
+          pageSize: Math.min(pageSize || 50, 100),
+          pageToken: pageToken,
+          fields: "nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, size, parents)",
+          orderBy,
+          ...ALL_DRIVES_LIST_PARAMS
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.list(search)',
+        ctx.log
+      );
 
       // Resolve folder paths from parent IDs (with dedup for concurrent lookups)
       const pathCache: Record<string, Promise<string>> = {};
@@ -813,11 +883,16 @@ export async function handleTool(
         if (folderId in pathCache) return pathCache[folderId];
         const promise = (async () => {
           try {
-            const folderRes = await ctx.getDrive().files.get({
-              fileId: folderId,
-              fields: "name, parents",
-              supportsAllDrives: true,
-            });
+            const folderRes = await withRetry(
+              (signal) => ctx.getDrive().files.get({
+                fileId: folderId,
+                fields: "name, parents",
+                supportsAllDrives: true,
+              }, { signal }),
+              ctx.runtimeConfig,
+              'drive.files.get(parentPath)',
+              ctx.log
+            );
             const name = folderRes.data.name || folderId;
             const parents = folderRes.data.parents;
             if (parents && parents.length > 0 && parents[0] !== folderId) {
@@ -844,11 +919,18 @@ export async function handleTool(
         }),
       );
 
-      ctx.log('Search results', { query: userQuery, rawQuery: !!rawQuery, resultCount: files.length });
+      ctx.log('Search results', { query: userQuery, rawQuery: !!rawQuery, orderBy, resultCount: files.length });
 
-      let response = `Found ${files.length} files:\n${fileLines.join("\n")}`;
+      // Name the ordering in the response: an unlabeled list invites the caller to
+      // pick "the most recent" by eye and get it wrong (#167).
+      let response = `Found ${files.length} files (ordered by ${orderBy}):\n${fileLines.join("\n")}`;
       if (res.data.nextPageToken) {
+        // Keep the token alone on its line — trailing text after an unquoted token
+        // invites the caller to carry it into the token value.
         response += `\n\nMore results available. Use pageToken: ${res.data.nextPageToken}`;
+        // orderBy has a default, so a follow-up call carrying only the token would
+        // silently fall back to `modifiedTime desc` and re-sort page 2 (#167).
+        response += `\nPass orderBy: ${orderBy} again to keep this ordering.`;
       }
 
       return {
@@ -882,14 +964,19 @@ export async function handleTool(
         parents: [parentFolderId]
       };
 
-      const file = await ctx.getDrive().files.create({
-        requestBody: fileMetadata,
-        media: {
-          mimeType: fileMetadata.mimeType,
-          body: data.content,
-        },
-        supportsAllDrives: true
-      });
+      const file = await withRetry(
+        (signal) => ctx.getDrive().files.create({
+          requestBody: fileMetadata,
+          media: {
+            mimeType: fileMetadata.mimeType,
+            body: data.content,
+          },
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+        'drive.files.create(textFile)',
+        ctx.log
+      );
 
       ctx.log('File created successfully', { fileId: file.data?.id });
       return {
@@ -909,11 +996,16 @@ export async function handleTool(
       const data = validation.data;
 
       // Check file MIME type
-      const existingFile = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'mimeType, name, parents',
-        supportsAllDrives: true
-      });
+      const existingFile = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'mimeType, name, parents',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(mimeCheck)',
+        ctx.log
+      );
 
       const currentMimeType = existingFile.data.mimeType || 'text/plain';
       if (!isTextMime(currentMimeType)) {
@@ -927,16 +1019,21 @@ export async function handleTool(
         updateMetadata.mimeType = getMimeTypeFromFilename(data.name);
       }
 
-      const updatedFile = await ctx.getDrive().files.update({
-        fileId: data.fileId,
-        requestBody: updateMetadata,
-        media: {
-          mimeType: updateMetadata.mimeType || currentMimeType,
-          body: data.content
-        },
-        fields: 'id, name, modifiedTime, webViewLink',
-        supportsAllDrives: true
-      });
+      const updatedFile = await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.fileId,
+          requestBody: updateMetadata,
+          media: {
+            mimeType: updateMetadata.mimeType || currentMimeType,
+            body: data.content
+          },
+          fields: 'id, name, modifiedTime, webViewLink',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+        'drive.files.update(textFile)',
+        ctx.log
+      );
 
       return {
         content: [{
@@ -954,11 +1051,16 @@ export async function handleTool(
       }
       const data = validation.data;
 
-      const metadata = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'mimeType, name',
-        supportsAllDrives: true
-      });
+      const metadata = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'mimeType, name',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(readTextFile)',
+        ctx.log
+      );
 
       const mimeType = metadata.data.mimeType || '';
       const fileName = metadata.data.name || 'unknown';
@@ -1015,11 +1117,16 @@ export async function handleTool(
         parents: [parentFolderId]
       };
 
-      const folder = await ctx.getDrive().files.create({
-        requestBody: folderMetadata,
-        fields: 'id, name, webViewLink',
-        supportsAllDrives: true
-      });
+      const folder = await withRetry(
+        (signal) => ctx.getDrive().files.create({
+          requestBody: folderMetadata,
+          fields: 'id, name, webViewLink',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.create(folder)',
+        ctx.log
+      );
 
       ctx.log('Folder created successfully', { folderId: folder.data.id, name: folder.data.name });
 
@@ -1042,16 +1149,21 @@ export async function handleTool(
       // Default to root if no folder specified
       const targetFolderId = data.folderId || 'root';
 
-      const res = await ctx.getDrive().files.list({
-        q: `'${targetFolderId}' in parents and trashed = false`,
-        pageSize: Math.min(data.pageSize || 50, 100),
-        pageToken: data.pageToken,
-        fields: "nextPageToken, files(id, name, mimeType, modifiedTime, size)",
-        orderBy: "name",
-        // Parent-scoped: two flags only, no corpora=allDrives, so the listing
-        // can never come back as an incompleteSearch partial result (#137).
-        ...PARENT_SCOPED_LIST_PARAMS
-      });
+      const res = await withRetry(
+        (signal) => ctx.getDrive().files.list({
+          q: `'${targetFolderId}' in parents and trashed = false`,
+          pageSize: Math.min(data.pageSize || 50, 100),
+          pageToken: data.pageToken,
+          fields: "nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+          orderBy: "name",
+          // Parent-scoped: two flags only, no corpora=allDrives, so the listing
+          // can never come back as an incompleteSearch partial result (#137).
+          ...PARENT_SCOPED_LIST_PARAMS
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.list(folder)',
+        ctx.log
+      );
 
       const files = res.data.files || [];
       const formattedFiles = files.map((file: drive_v3.Schema$File) => {
@@ -1077,11 +1189,16 @@ export async function handleTool(
       }
       const data = validation.data;
 
-      const res = await ctx.getDrive().drives.list({
-        pageSize: Math.min(data.pageSize || 50, 100),
-        pageToken: data.pageToken,
-        fields: 'nextPageToken, drives(id, name, createdTime, hidden)'
-      });
+      const res = await withRetry(
+        (signal) => ctx.getDrive().drives.list({
+          pageSize: Math.min(data.pageSize || 50, 100),
+          pageToken: data.pageToken,
+          fields: 'nextPageToken, drives(id, name, createdTime, hidden)'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.drives.list',
+        ctx.log
+      );
 
       const drives = res.data.drives || [];
       if (drives.length === 0) {
@@ -1110,16 +1227,26 @@ export async function handleTool(
       }
       const data = validation.data;
 
-      const item = await ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name', supportsAllDrives: true });
+      const item = await withRetry(
+        (signal) => ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name', supportsAllDrives: true }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(deleteItem)',
+        ctx.log
+      );
 
       // Move to trash instead of permanent deletion
-      await ctx.getDrive().files.update({
-        fileId: data.itemId,
-        requestBody: {
-          trashed: true
-        },
-        supportsAllDrives: true
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.itemId,
+          requestBody: {
+            trashed: true
+          },
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(trash)',
+        ctx.log
+      );
 
       ctx.log('Item moved to trash successfully', { itemId: data.itemId, name: item.data.name });
       return {
@@ -1136,17 +1263,27 @@ export async function handleTool(
       const data = validation.data;
 
       // If it's a text file, check extension
-      const item = await ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name, mimeType', supportsAllDrives: true });
+      const item = await withRetry(
+        (signal) => ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name, mimeType', supportsAllDrives: true }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(renameItem)',
+        ctx.log
+      );
       if (Object.values(TEXT_MIME_TYPES).includes(item.data.mimeType || '')) {
         ctx.validateTextFileExtension(data.newName);
       }
 
-      const updatedItem = await ctx.getDrive().files.update({
-        fileId: data.itemId,
-        requestBody: { name: data.newName },
-        fields: 'id, name, modifiedTime',
-        supportsAllDrives: true
-      });
+      const updatedItem = await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.itemId,
+          requestBody: { name: data.newName },
+          fields: 'id, name, modifiedTime',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(rename)',
+        ctx.log
+      );
 
       return {
         content: [{
@@ -1173,23 +1310,38 @@ export async function handleTool(
         return errorResponse("Cannot move a folder into itself.");
       }
 
-      const item = await ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name, parents', supportsAllDrives: true });
+      const item = await withRetry(
+        (signal) => ctx.getDrive().files.get({ fileId: data.itemId, fields: 'name, parents', supportsAllDrives: true }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(moveItem)',
+        ctx.log
+      );
 
       // Perform move
-      await ctx.getDrive().files.update({
-        fileId: data.itemId,
-        addParents: destinationFolderId,
-        removeParents: item.data.parents?.join(',') || '',
-        fields: 'id, name, parents',
-        supportsAllDrives: true
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.itemId,
+          addParents: destinationFolderId,
+          removeParents: item.data.parents?.join(',') || '',
+          fields: 'id, name, parents',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(move)',
+        ctx.log
+      );
 
       // Get the destination folder name for a nice response
-      const destinationFolder = await ctx.getDrive().files.get({
-        fileId: destinationFolderId,
-        fields: 'name',
-        supportsAllDrives: true
-      });
+      const destinationFolder = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: destinationFolderId,
+          fields: 'name',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(destinationFolder)',
+        ctx.log
+      );
 
       return {
         content: [{
@@ -1208,11 +1360,16 @@ export async function handleTool(
       const data = validation.data;
 
       // Get original file info
-      const originalFile = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'name,parents',
-        supportsAllDrives: true
-      });
+      const originalFile = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'name,parents',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(copySource)',
+        ctx.log
+      );
 
       const copyMetadata: any = {
         name: data.newName || `Copy of ${originalFile.data.name}`
@@ -1225,12 +1382,17 @@ export async function handleTool(
         copyMetadata.parents = originalFile.data.parents;
       }
 
-      const response = await ctx.getDrive().files.copy({
-        fileId: data.fileId,
-        requestBody: copyMetadata,
-        fields: 'id,name,webViewLink,parents',
-        supportsAllDrives: true
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().files.copy({
+          fileId: data.fileId,
+          requestBody: copyMetadata,
+          fields: 'id,name,webViewLink,parents',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.copy',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Successfully copied file as "${response.data.name}"\nNew file ID: ${response.data.id}\nLink: ${response.data.webViewLink}` }],
@@ -1248,26 +1410,36 @@ export async function handleTool(
       const parentId = await ctx.resolveFolderId(data.parentFolderId);
 
       // Get target file metadata for default name
-      const targetFile = await ctx.getDrive().files.get({
-        fileId: data.targetFileId,
-        fields: 'id, name, mimeType',
-        supportsAllDrives: true
-      });
+      const targetFile = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.targetFileId,
+          fields: 'id, name, mimeType',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(shortcutTarget)',
+        ctx.log
+      );
 
       const shortcutName = data.shortcutName || targetFile.data.name || 'Shortcut';
 
-      const shortcut = await ctx.getDrive().files.create({
-        requestBody: {
-          name: shortcutName,
-          mimeType: SHORTCUT_MIME_TYPE,
-          shortcutDetails: {
-            targetId: data.targetFileId
+      const shortcut = await withRetry(
+        (signal) => ctx.getDrive().files.create({
+          requestBody: {
+            name: shortcutName,
+            mimeType: SHORTCUT_MIME_TYPE,
+            shortcutDetails: {
+              targetId: data.targetFileId
+            },
+            parents: [parentId]
           },
-          parents: [parentId]
-        },
-        fields: 'id, name, webViewLink, shortcutDetails',
-        supportsAllDrives: true
-      });
+          fields: 'id, name, webViewLink, shortcutDetails',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.create(shortcut)',
+        ctx.log
+      );
 
       ctx.log('Shortcut created', {
         shortcutId: shortcut.data.id,
@@ -1291,11 +1463,16 @@ export async function handleTool(
       }
       const data = validation.data;
 
-      const fileInfo = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'id, name, contentRestrictions',
-        supportsAllDrives: true
-      });
+      const fileInfo = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'id, name, contentRestrictions',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(lockCheck)',
+        ctx.log
+      );
 
       const existingRestrictions = fileInfo.data.contentRestrictions || [];
       if (existingRestrictions.some((r) => r.readOnly)) {
@@ -1308,17 +1485,22 @@ export async function handleTool(
         };
       }
 
-      await ctx.getDrive().files.update({
-        fileId: data.fileId,
-        requestBody: {
-          contentRestrictions: [{
-            readOnly: true,
-            reason: data.reason || 'Locked via MCP',
-            ownerRestricted: data.ownerRestricted ?? false
-          }]
-        },
-        supportsAllDrives: true
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.fileId,
+          requestBody: {
+            contentRestrictions: [{
+              readOnly: true,
+              reason: data.reason || 'Locked via MCP',
+              ownerRestricted: data.ownerRestricted ?? false
+            }]
+          },
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(lock)',
+        ctx.log
+      );
 
       ctx.log('File locked', { fileId: data.fileId, name: fileInfo.data.name, reason: data.reason });
 
@@ -1338,11 +1520,16 @@ export async function handleTool(
       }
       const data = validation.data;
 
-      const fileInfo = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'id, name, contentRestrictions',
-        supportsAllDrives: true
-      });
+      const fileInfo = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'id, name, contentRestrictions',
+          supportsAllDrives: true
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(unlockCheck)',
+        ctx.log
+      );
 
       const existingRestrictions = fileInfo.data.contentRestrictions || [];
       if (!existingRestrictions.some((r) => r.readOnly)) {
@@ -1355,13 +1542,18 @@ export async function handleTool(
         };
       }
 
-      await ctx.getDrive().files.update({
-        fileId: data.fileId,
-        requestBody: {
-          contentRestrictions: [{ readOnly: false }]
-        },
-        supportsAllDrives: true
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: data.fileId,
+          requestBody: {
+            contentRestrictions: [{ readOnly: false }]
+          },
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(unlock)',
+        ctx.log
+      );
 
       ctx.log('File unlocked', { fileId: data.fileId, name: fileInfo.data.name });
 
@@ -1417,11 +1609,16 @@ export async function handleTool(
       let detectedMime = data.mimeType || BINARY_MIME_TYPES[ext] || '';
       if (!detectedMime && data.fileId) {
         // In-place update with no MIME hint: reuse the existing file's MIME type
-        const existing = await ctx.getDrive().files.get({
-          fileId: data.fileId,
-          fields: 'mimeType',
-          supportsAllDrives: true
-        });
+        const existing = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: data.fileId,
+            fields: 'mimeType',
+            supportsAllDrives: true
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(uploadMimeLookup)',
+          ctx.log
+        );
         const existingMime = existing.data.mimeType || '';
         if (existingMime.startsWith('application/vnd.google-apps')) {
           return errorResponse(
@@ -1467,16 +1664,21 @@ export async function handleTool(
         if (data.name) {
           requestBody.name = data.name;
         }
-        file = await ctx.getDrive().files.update({
-          fileId: data.fileId,
-          requestBody,
-          media: {
-            mimeType: detectedMime,
-            body: mediaBody()
-          },
-          fields: 'id, name, size, mimeType, webViewLink',
-          supportsAllDrives: true
-        });
+        file = await withRetry(
+          (signal) => ctx.getDrive().files.update({
+            fileId: data.fileId,
+            requestBody,
+            media: {
+              mimeType: detectedMime,
+              body: mediaBody()
+            },
+            fields: 'id, name, size, mimeType, webViewLink',
+            supportsAllDrives: true
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+          'drive.files.update(uploadInPlace)',
+          ctx.log
+        );
       } else {
         const parentId = await ctx.resolveFolderId(data.parentFolderId);
         const requestBody: any = {
@@ -1486,15 +1688,20 @@ export async function handleTool(
         if (targetMimeType) {
           requestBody.mimeType = targetMimeType;
         }
-        file = await ctx.getDrive().files.create({
-          requestBody,
-          media: {
-            mimeType: detectedMime,
-            body: mediaBody()
-          },
-          fields: 'id, name, size, mimeType, webViewLink',
-          supportsAllDrives: true
-        });
+        file = await withRetry(
+          (signal) => ctx.getDrive().files.create({
+            requestBody,
+            media: {
+              mimeType: detectedMime,
+              body: mediaBody()
+            },
+            fields: 'id, name, size, mimeType, webViewLink',
+            supportsAllDrives: true
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+          'drive.files.create(upload)',
+          ctx.log
+        );
       }
 
       ctx.log('File uploaded successfully', { fileId: file.data?.id, updated: !!data.fileId });
@@ -1544,11 +1751,16 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const response = await ctx.getDrive().permissions.list({
-        fileId: data.fileId,
-        fields: 'permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))',
-        supportsAllDrives: true,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().permissions.list({
+          fileId: data.fileId,
+          fields: 'permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))',
+          supportsAllDrives: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.permissions.list',
+        ctx.log
+      );
 
       const permissions = response.data.permissions || [];
       if (permissions.length === 0) {
@@ -1573,23 +1785,48 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const response = await ctx.getDrive().permissions.create({
-        fileId: data.fileId,
-        requestBody: {
-          type: data.type,
-          role: data.role,
-          ...((data.type === "user" || data.type === "group") && { emailAddress: data.emailAddress }),
-          ...(data.type === "domain" && { domain: data.domain }),
-          ...((data.type === "anyone" || data.type === "domain") && data.allowFileDiscovery !== undefined && { allowFileDiscovery: data.allowFileDiscovery }),
-        },
-        sendNotificationEmail: data.sendNotificationEmail,
-        ...(data.emailMessage && { emailMessage: data.emailMessage }),
-        fields: 'id,type,role,emailAddress,domain,allowFileDiscovery',
-        supportsAllDrives: true,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().permissions.create({
+          fileId: data.fileId,
+          requestBody: {
+            type: data.type,
+            role: data.role,
+            ...((data.type === "user" || data.type === "group") && { emailAddress: data.emailAddress }),
+            ...(data.type === "domain" && { domain: data.domain }),
+            ...((data.type === "anyone" || data.type === "domain") && data.allowFileDiscovery !== undefined && { allowFileDiscovery: data.allowFileDiscovery }),
+          },
+          sendNotificationEmail: data.sendNotificationEmail,
+          ...(data.emailMessage && { emailMessage: data.emailMessage }),
+          fields: 'id,type,role,emailAddress,domain,allowFileDiscovery',
+          supportsAllDrives: true,
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.permissions.create(addPermission)',
+        ctx.log
+      );
 
       const principal = response.data.emailAddress || response.data.domain || data.emailAddress || data.domain || data.type;
-      return { content: [{ type: 'text', text: `Permission added: ${response.data.id} (${response.data.role}) for ${principal}` }], isError: false };
+      const permissionId = response.data.id ?? 'unknown';
+      const outcome = await reconcileCreatedPermissionRole(ctx, ctx.getDrive(), data.fileId, response.data, data.role);
+      if (!outcome.ok) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Permission MISMATCH for ${principal}: ${outcome.detail}. Verify with listPermissions and fix manually. Permission id: ${permissionId}`,
+          }],
+          isError: true,
+        };
+      }
+      if (outcome.corrected) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Permission added for ${principal}: Drive initially applied ${describeRole(outcome.initiallyApplied)} instead of the requested '${data.role}' (most likely because ${principal} already held a permission on this file); that permission's role was changed to '${outcome.role}'. Permission id: ${permissionId}`,
+          }],
+          isError: false,
+        };
+      }
+      return { content: [{ type: 'text', text: `Permission added: ${permissionId} (${outcome.role}) for ${principal}` }], isError: false };
     }
 
     case "updatePermission": {
@@ -1597,14 +1834,28 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const response = await ctx.getDrive().permissions.update({
-        fileId: data.fileId,
-        permissionId: data.permissionId,
-        requestBody: { role: data.role },
-        fields: 'id,type,role,emailAddress',
-        supportsAllDrives: true,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().permissions.update({
+          fileId: data.fileId,
+          permissionId: data.permissionId,
+          requestBody: { role: data.role },
+          fields: 'id,type,role,emailAddress',
+          supportsAllDrives: true,
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.permissions.update',
+        ctx.log
+      );
 
+      if (response.data.role !== data.role) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Permission update MISMATCH: requested '${data.role}' for ${response.data.id ?? data.permissionId} but Drive reports ${describeRole(response.data.role)}. Verify with listPermissions.`,
+          }],
+          isError: true,
+        };
+      }
       return { content: [{ type: 'text', text: `Permission updated: ${response.data.id} => ${response.data.role}` }], isError: false };
     }
 
@@ -1615,11 +1866,16 @@ export async function handleTool(
 
       let permissionId: string | undefined = data.permissionId;
       if (!permissionId && data.emailAddress) {
-        const listed = await ctx.getDrive().permissions.list({
-          fileId: data.fileId,
-          fields: 'permissions(id,type,emailAddress)',
-          supportsAllDrives: true,
-        });
+        const listed = await withRetry(
+          (signal) => ctx.getDrive().permissions.list({
+            fileId: data.fileId,
+            fields: 'permissions(id,type,emailAddress)',
+            supportsAllDrives: true,
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.permissions.list(removeLookup)',
+          ctx.log
+        );
         const found = (listed.data.permissions || []).find(
           (p) => p.type === 'user' && (p.emailAddress || '').toLowerCase() === data.emailAddress!.toLowerCase(),
         );
@@ -1633,11 +1889,16 @@ export async function handleTool(
         return errorResponse("Could not resolve a permission ID to remove");
       }
 
-      await ctx.getDrive().permissions.delete({
-        fileId: data.fileId,
-        permissionId,
-        supportsAllDrives: true,
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().permissions.delete({
+          fileId: data.fileId,
+          permissionId,
+          supportsAllDrives: true,
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.permissions.delete',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Permission removed: ${permissionId}` }], isError: false };
     }
@@ -1648,11 +1909,16 @@ export async function handleTool(
       const data = validation.data;
 
       // Idempotent behavior: update existing permission for the same principal instead of creating duplicates.
-      const existing = await ctx.getDrive().permissions.list({
-        fileId: data.fileId,
-        fields: 'permissions(id,type,emailAddress,role)',
-        supportsAllDrives: true,
-      });
+      const existing = await withRetry(
+        (signal) => ctx.getDrive().permissions.list({
+          fileId: data.fileId,
+          fields: 'permissions(id,type,emailAddress,role)',
+          supportsAllDrives: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.permissions.list(shareFileLookup)',
+        ctx.log
+      );
 
       const existingPerm = (existing.data.permissions || []).find(
         (p) => p.type === 'user' && (p.emailAddress || '').toLowerCase() === data.emailAddress.toLowerCase(),
@@ -1666,13 +1932,28 @@ export async function handleTool(
           };
         }
 
-        const updated = await ctx.getDrive().permissions.update({
-          fileId: data.fileId,
-          permissionId: existingPerm.id,
-          requestBody: { role: data.role },
-          fields: 'id,type,role,emailAddress',
-          supportsAllDrives: true,
-        });
+        const updated = await withRetry(
+          (signal) => ctx.getDrive().permissions.update({
+            fileId: data.fileId,
+            permissionId: existingPerm.id!,
+            requestBody: { role: data.role },
+            fields: 'id,type,role,emailAddress',
+            supportsAllDrives: true,
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'drive.permissions.update(shareFile)',
+          ctx.log
+        );
+
+        if (updated.data.role !== data.role) {
+          return {
+            content: [{
+              type: 'text',
+              text: `Permission update MISMATCH for ${updated.data.emailAddress || data.emailAddress}: requested '${data.role}' but Drive reports ${describeRole(updated.data.role)}. Verify with listPermissions. Permission ID: ${existingPerm.id}`,
+            }],
+            isError: true,
+          };
+        }
 
         return {
           content: [{ type: 'text', text: `Updated existing permission for ${updated.data.emailAddress || data.emailAddress} to ${updated.data.role}. Permission ID: ${updated.data.id}` }],
@@ -1680,21 +1961,47 @@ export async function handleTool(
         };
       }
 
-      const response = await ctx.getDrive().permissions.create({
-        fileId: data.fileId,
-        requestBody: {
-          type: 'user',
-          role: data.role,
-          emailAddress: data.emailAddress,
-        },
-        sendNotificationEmail: data.sendNotificationEmail,
-        ...(data.emailMessage && { emailMessage: data.emailMessage }),
-        fields: 'id,type,role,emailAddress',
-        supportsAllDrives: true,
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().permissions.create({
+          fileId: data.fileId,
+          requestBody: {
+            type: 'user',
+            role: data.role,
+            emailAddress: data.emailAddress,
+          },
+          sendNotificationEmail: data.sendNotificationEmail,
+          ...(data.emailMessage && { emailMessage: data.emailMessage }),
+          fields: 'id,type,role,emailAddress',
+          supportsAllDrives: true,
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.permissions.create(shareFile)',
+        ctx.log
+      );
 
+      const recipient = response.data.emailAddress || data.emailAddress;
+      const permissionId = response.data.id ?? 'unknown';
+      const outcome = await reconcileCreatedPermissionRole(ctx, ctx.getDrive(), data.fileId, response.data, data.role);
+      if (!outcome.ok) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Permission MISMATCH for ${recipient}: ${outcome.detail}. Verify with listPermissions and fix manually. Permission ID: ${permissionId}`,
+          }],
+          isError: true,
+        };
+      }
+      if (outcome.corrected) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Shared file with ${recipient} as ${outcome.role}: Drive initially applied ${describeRole(outcome.initiallyApplied)} instead of the requested '${data.role}' (most likely because ${recipient} already held a permission on this file); that permission's role was changed to '${outcome.role}'. Permission ID: ${permissionId}`,
+          }],
+          isError: false,
+        };
+      }
       return {
-        content: [{ type: 'text', text: `Shared file with ${response.data.emailAddress || data.emailAddress} as ${response.data.role}. Permission ID: ${response.data.id}` }],
+        content: [{ type: 'text', text: `Shared file with ${recipient} as ${outcome.role}. Permission ID: ${permissionId}` }],
         isError: false,
       };
     }
@@ -1704,27 +2011,37 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const source = await ctx.getDrive().files.get({
-        fileId: data.fileId,
-        fields: 'id,name,mimeType,parents',
-        supportsAllDrives: true,
-      });
+      const source = await withRetry(
+        (signal) => ctx.getDrive().files.get({
+          fileId: data.fileId,
+          fields: 'id,name,mimeType,parents',
+          supportsAllDrives: true,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.get(pdfSource)',
+        ctx.log
+      );
 
       if (source.data.mimeType !== 'application/pdf') {
         return errorResponse(`File ${data.fileId} is not a PDF (mimeType=${source.data.mimeType || 'unknown'})`);
       }
 
       const parentId = data.parentFolderId || source.data.parents?.[0];
-      const converted = await ctx.getDrive().files.copy({
-        fileId: data.fileId,
-        requestBody: {
-          name: data.newName || `${source.data.name || 'Converted PDF'} (Doc)`,
-          mimeType: 'application/vnd.google-apps.document',
-          ...(parentId ? { parents: [parentId] } : {}),
-        },
-        fields: 'id,name,webViewLink,mimeType',
-        supportsAllDrives: true,
-      });
+      const converted = await withRetry(
+        (signal) => ctx.getDrive().files.copy({
+          fileId: data.fileId,
+          requestBody: {
+            name: data.newName || `${source.data.name || 'Converted PDF'} (Doc)`,
+            mimeType: 'application/vnd.google-apps.document',
+            ...(parentId ? { parents: [parentId] } : {}),
+          },
+          fields: 'id,name,webViewLink,mimeType',
+          supportsAllDrives: true,
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.copy(pdfToDoc)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Converted PDF to Google Doc: ${converted.data.name}\nID: ${converted.data.id}\nLink: ${converted.data.webViewLink}` }], isError: false };
     }
@@ -1734,15 +2051,20 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const list = await ctx.getDrive().files.list({
-        q: `'${data.folderId}' in parents and mimeType='application/pdf' and trashed=false`,
-        pageSize: data.maxResults,
-        fields: 'files(id,name,mimeType)',
-        // Parent-scoped: two flags only, no corpora=allDrives, so this PDF list
-        // can never be an incompleteSearch partial result that silently skips
-        // files before the conversion loop (#137).
-        ...PARENT_SCOPED_LIST_PARAMS,
-      });
+      const list = await withRetry(
+        (signal) => ctx.getDrive().files.list({
+          q: `'${data.folderId}' in parents and mimeType='application/pdf' and trashed=false`,
+          pageSize: data.maxResults,
+          fields: 'files(id,name,mimeType)',
+          // Parent-scoped: two flags only, no corpora=allDrives, so this PDF list
+          // can never be an incompleteSearch partial result that silently skips
+          // files before the conversion loop (#137).
+          ...PARENT_SCOPED_LIST_PARAMS,
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.list(bulkPdf)',
+        ctx.log
+      );
 
       const files = list.data.files || [];
       const results: Array<{ id?: string; name?: string; docId?: string; ok: boolean; error?: string }> = [];
@@ -1750,16 +2072,21 @@ export async function handleTool(
       // Sequential processing is intentional — parallel copies trigger Google API rate limits.
       for (const f of files) {
         try {
-          const converted = await ctx.getDrive().files.copy({
-            fileId: f.id!,
-            requestBody: {
-              name: `${f.name || 'Converted PDF'} (Doc)`,
-              mimeType: 'application/vnd.google-apps.document',
-              parents: [data.folderId],
-            },
-            fields: 'id,name',
-            supportsAllDrives: true,
-          });
+          const converted = await withRetry(
+            (signal) => ctx.getDrive().files.copy({
+              fileId: f.id!,
+              requestBody: {
+                name: `${f.name || 'Converted PDF'} (Doc)`,
+                mimeType: 'application/vnd.google-apps.document',
+                parents: [data.folderId],
+              },
+              fields: 'id,name',
+              supportsAllDrives: true,
+            }, { signal }),
+            { ...ctx.runtimeConfig, retryMax: 0 },
+            'drive.files.copy(bulkPdfToDoc)',
+            ctx.log
+          );
           results.push({ id: f.id ?? undefined, name: f.name ?? undefined, docId: converted.data.id ?? undefined, ok: true });
         } catch (err: any) {
           const message = err?.message || 'Unknown conversion error';
@@ -1786,12 +2113,17 @@ export async function handleTool(
 
       if (!data.split) {
         const fileName = data.namePrefix || basename(data.localPath) || 'upload.pdf';
-        const uploaded = await ctx.getDrive().files.create({
-          requestBody: { name: fileName, parents: [parentId] },
-          media: { mimeType: 'application/pdf', body: createReadStream(data.localPath) },
-          fields: 'id,name,webViewLink',
-          supportsAllDrives: true,
-        });
+        const uploaded = await withRetry(
+          (signal) => ctx.getDrive().files.create({
+            requestBody: { name: fileName, parents: [parentId] },
+            media: { mimeType: 'application/pdf', body: createReadStream(data.localPath) },
+            fields: 'id,name,webViewLink',
+            supportsAllDrives: true,
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+          'drive.files.create(pdfNoSplit)',
+          ctx.log
+        );
 
         return {
           content: [{ type: 'text', text: `Uploaded PDF without split: ${uploaded.data.name}\nID: ${uploaded.data.id}` }],
@@ -1812,12 +2144,17 @@ export async function handleTool(
           const partPath = splitResult.files[i];
           const partName = `${baseName}-part-${i + 1}.pdf`;
 
-          const uploaded = await ctx.getDrive().files.create({
-            requestBody: { name: partName, parents: [parentId] },
-            media: { mimeType: 'application/pdf', body: createReadStream(partPath) },
-            fields: 'id,name,webViewLink',
-            supportsAllDrives: true,
-          });
+          const uploaded = await withRetry(
+            (signal) => ctx.getDrive().files.create({
+              requestBody: { name: partName, parents: [parentId] },
+              media: { mimeType: 'application/pdf', body: createReadStream(partPath) },
+              fields: 'id,name,webViewLink',
+              supportsAllDrives: true,
+            }, { signal }),
+            { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+            'drive.files.create(pdfPart)',
+            ctx.log
+          );
 
           uploadedParts.push({ id: uploaded.data.id, name: uploaded.data.name });
         }
@@ -1842,12 +2179,17 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      const response = await ctx.getDrive().revisions.list({
-        fileId: data.fileId,
-        pageSize: data.pageSize,
-        pageToken: data.pageToken,
-        fields: 'nextPageToken,revisions(id,modifiedTime,lastModifyingUser(displayName,emailAddress),keepForever,size,originalFilename)',
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().revisions.list({
+          fileId: data.fileId,
+          pageSize: data.pageSize,
+          pageToken: data.pageToken,
+          fields: 'nextPageToken,revisions(id,modifiedTime,lastModifyingUser(displayName,emailAddress),keepForever,size,originalFilename)',
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.revisions.list',
+        ctx.log
+      );
 
       const revisions: drive_v3.Schema$Revision[] = response.data.revisions || [];
       if (revisions.length === 0) {
@@ -1881,11 +2223,16 @@ export async function handleTool(
 
       try {
         // Get current file metadata to determine restore strategy
-        const current = await ctx.getDrive().files.get({
-          fileId: data.fileId,
-          fields: 'name,mimeType',
-          supportsAllDrives: true,
-        });
+        const current = await withRetry(
+          (signal) => ctx.getDrive().files.get({
+            fileId: data.fileId,
+            fields: 'name,mimeType',
+            supportsAllDrives: true,
+          }, { signal }),
+          ctx.runtimeConfig,
+          'drive.files.get(restoreCurrent)',
+          ctx.log
+        );
 
         const fileMimeType = current.data.mimeType || '';
         const isWorkspaceFile = fileMimeType.startsWith('application/vnd.google-apps.');
@@ -1896,11 +2243,16 @@ export async function handleTool(
         if (isWorkspaceFile) {
           // Workspace files don't support revisions.get with alt=media.
           // Use the revision's exportLinks to fetch content in an editable format.
-          const revision = await ctx.getDrive().revisions.get({
-            fileId: data.fileId,
-            revisionId: data.revisionId,
-            fields: 'id,exportLinks',
-          });
+          const revision = await withRetry(
+            (signal) => ctx.getDrive().revisions.get({
+              fileId: data.fileId,
+              revisionId: data.revisionId,
+              fields: 'id,exportLinks',
+            }, { signal }),
+            ctx.runtimeConfig,
+            'drive.revisions.get(exportLinks)',
+            ctx.log
+          );
 
           const exportLinks = (revision.data.exportLinks as Record<string, string> | null) || {};
 
@@ -1921,27 +2273,49 @@ export async function handleTool(
 
           uploadMimeType = selectedMime;
 
-          // Fetch revision content from the export link using authenticated request
-          const exportResponse = await ctx.authClient.request({ url: exportLinks[selectedMime], responseType: 'stream' });
-          revisionBody = exportResponse.data;
-        } else {
-          // For binary files, download the revision content directly
-          const revision = await ctx.getDrive().revisions.get(
-            { fileId: data.fileId, revisionId: data.revisionId, alt: 'media' },
-            { responseType: 'stream' },
+          // Fetch revision content from the export link using authenticated request.
+          // responseType: 'stream' means this promise settles once the response
+          // headers arrive, not once the body is fully read — the actual transfer
+          // happens later, when toNodeReadable's consumer drains exportResponse.data.
+          // A timeout around this await therefore bounds only the time to obtain
+          // the stream, never a slow download in progress, so it gets the same
+          // full-retry treatment as every other read.
+          const exportResponse = await withRetry(
+            (signal): Promise<any> => ctx.authClient.request({ url: exportLinks[selectedMime], responseType: 'stream', signal }),
+            ctx.runtimeConfig,
+            'authClient.request(restoreRevision.export)',
+            ctx.log
           );
-          revisionBody = revision.data;
+          revisionBody = toNodeReadable(exportResponse.data);
+        } else {
+          // For binary files, download the revision content directly. Same
+          // stream-settles-at-headers reasoning as above applies here.
+          const revision = await withRetry(
+            (signal) => ctx.getDrive().revisions.get(
+              { fileId: data.fileId, revisionId: data.revisionId, alt: 'media' },
+              { responseType: 'stream', signal },
+            ),
+            ctx.runtimeConfig,
+            'drive.revisions.get(restoreRevision.media)',
+            ctx.log
+          );
+          revisionBody = toNodeReadable(revision.data);
           uploadMimeType = fileMimeType || 'application/octet-stream';
         }
 
-        await ctx.getDrive().files.update({
-          fileId: data.fileId,
-          media: {
-            mimeType: uploadMimeType,
-            body: revisionBody,
-          },
-          supportsAllDrives: true,
-        });
+        await withRetry(
+          (signal) => ctx.getDrive().files.update({
+            fileId: data.fileId,
+            media: {
+              mimeType: uploadMimeType,
+              body: revisionBody,
+            },
+            supportsAllDrives: true,
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0, apiTimeout: UPLOAD_TIMEOUT_MS },
+          'drive.files.update(restoreRevision)',
+          ctx.log
+        );
 
         const restoreMsg = `Restored file ${data.fileId} (${current.data.name || 'unnamed'}) from revision ${data.revisionId}.`;
         const workspaceWarning = isWorkspaceFile
@@ -2088,18 +2462,28 @@ export async function handleTool(
       try {
         let check: { mode: string; [key: string]: unknown };
         if (data.fileId) {
-          const file = await ctx.getDrive().files.get({
-            fileId: data.fileId,
-            fields: 'id,name,mimeType,permissions',
-            supportsAllDrives: true,
-          });
+          const file = await withRetry(
+            (signal) => ctx.getDrive().files.get({
+              fileId: data.fileId!,
+              fields: 'id,name,mimeType,permissions',
+              supportsAllDrives: true,
+            }, { signal }),
+            ctx.runtimeConfig,
+            'drive.files.get(authTest)',
+            ctx.log
+          );
           check = { mode: 'file', fileId: file.data.id, name: file.data.name, mimeType: file.data.mimeType };
         } else {
-          const list = await ctx.getDrive().files.list({
-            pageSize: 1,
-            fields: 'files(id,name,mimeType)',
-            ...ALL_DRIVES_LIST_PARAMS,
-          });
+          const list = await withRetry(
+            (signal) => ctx.getDrive().files.list({
+              pageSize: 1,
+              fields: 'files(id,name,mimeType)',
+              ...ALL_DRIVES_LIST_PARAMS,
+            }, { signal }),
+            ctx.runtimeConfig,
+            'drive.files.list(authTest)',
+            ctx.log
+          );
           check = { mode: 'list', visibleCount: list.data.files?.length || 0, sample: list.data.files?.[0] || null };
         }
 

@@ -2,26 +2,16 @@ import { z } from 'zod';
 import type { sheets_v4 } from 'googleapis';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
 import { errorResponse } from '../types.js';
+import { parseA1Range, convertA1ToGridRange, escapeDriveQuery, ALL_DRIVES_LIST_PARAMS, DRIVE_ORDER_BY_VALUES, type GridRange } from '../utils.js';
 import {
-  parseA1Range,
-  convertA1ToGridRange,
-  colToIndex,
-  escapeDriveQuery,
-  ALL_DRIVES_LIST_PARAMS,
-  type GridRange,
-} from '../utils.js';
+  CELL_FIELDS, DEFAULT_CELL_FIELDS, SHEET_METADATA, buildFieldMask, collectSheetMetadata,
+  extractRanges, matchRangesToGridData, type RangeMatch, type SheetLike,
+} from './sheetCells.js';
+import {
+  blockFromMatch, buildPreImage, checkWriteRanges, fingerprintOf, findHazards, guardRangesFor,
+  padToDeclaredRange, projectResponseValue, type CanonicalBlock, type Hazard, type PreImageRange,
+} from './sheetGuard.js';
 import { withRetry } from '../utils/retry.js';
-
-const DEFAULT_SHEET_READ_MAX_ROWS = 500;
-const DEFAULT_SHEET_READ_MAX_CELLS = 20_000;
-const DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS = 60_000;
-const MAX_SHEET_READ_ROWS = 5_000;
-const MAX_SHEET_READ_CELLS = 100_000;
-const MAX_SHEET_READ_OUTPUT_CHARS = 80_000;
-
-const MAX_SHEET_WRITE_ROWS = 5_000;
-const MAX_SHEET_WRITE_CELLS = 50_000;
-const MAX_SHEET_WRITE_BYTES = 1_500_000;
 
 // ---------------------------------------------------------------------------
 // Zod Schemas
@@ -41,15 +31,86 @@ const UpdateGoogleSheetSchema = z.object({
   valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional()
 });
 
+// One call, many ranges. Field names follow the API's own ValueRange shape
+// ({range, values}) rather than updateGoogleSheet's `data`, so the nesting does
+// not read as `data[].data` and matches what the batch endpoint documents.
+const BatchUpdateGoogleSheetValuesSchema = z.object({
+  // required_error as well as min(): on a missing key Zod reports a bare
+  // "Required", which tells a caller nothing about which field it means.
+  spreadsheetId: z.string({ required_error: "Spreadsheet ID is required" })
+    .min(1, "Spreadsheet ID is required"),
+  updates: z.array(z.object({
+    range: z.string({ required_error: "Range is required" }).min(1, "Range is required"),
+    values: z.array(z.array(z.string()), { required_error: "Values are required" })
+  }), { required_error: "At least one update is required" })
+    .min(1, "At least one update is required"),
+  valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional()
+});
+
+const UpdateGoogleSheetIfUnchangedSchema = z.object({
+  spreadsheetId: z.string({ required_error: "Spreadsheet ID is required" }).min(1, "Spreadsheet ID is required"),
+  updates: z.array(z.object({
+    range: z.string({ required_error: "Range is required" }).min(1, "Range is required"),
+    values: z.array(z.array(z.string()), { required_error: "Values are required" })
+  }), { required_error: "At least one update is required" }).min(1, "At least one update is required"),
+  guardRanges: z.array(z.string().min(1)).optional(),
+  expectedFingerprint: z.string().regex(/^v1:[0-9a-f]{64}$/, "expectedFingerprint must be a v1: fingerprint returned by a dryRun call").optional(),
+  valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED"),
+  dryRun: z.boolean().optional().default(false),
+  maxCells: z.number().int().min(1).max(100000).optional().default(2000),
+  maxBytes: z.number().int().min(1024).max(4 * 1024 * 1024).optional().default(131072)
+}).refine(a => a.dryRun || a.expectedFingerprint !== undefined, {
+  message: "expectedFingerprint is required unless dryRun is true - call with dryRun first to obtain it"
+});
+
 const GetGoogleSheetContentSchema = z.object({
   spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
   range: z.string().min(1, "Range is required"),
-  maxRows: z.number().int().min(1).max(MAX_SHEET_READ_ROWS).optional()
-    .default(DEFAULT_SHEET_READ_MAX_ROWS),
-  maxCells: z.number().int().min(1).max(MAX_SHEET_READ_CELLS).optional()
-    .default(DEFAULT_SHEET_READ_MAX_CELLS),
-  maxOutputChars: z.number().int().min(1_000).max(MAX_SHEET_READ_OUTPUT_CHARS).optional()
-    .default(DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS),
+  valueRenderOption: z.enum(["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]).optional().default("FORMATTED_VALUE")
+});
+
+const GetGoogleSheetCellsSchema = z.object({
+  spreadsheetId: z.string({ required_error: "Spreadsheet ID is required" }).min(1, "Spreadsheet ID is required"),
+  ranges: z.array(z.string().min(1), { required_error: "At least one range is required" })
+    .min(1, "At least one range is required"),
+  fields: z.array(z.enum(CELL_FIELDS)).optional()
+    .default([...DEFAULT_CELL_FIELDS]),
+  sheetMetadata: z.array(z.enum(SHEET_METADATA)).optional().default([]),
+  includeEmpty: z.boolean().optional().default(false),
+  maxCells: z.number().int().min(1).max(100000).optional().default(2000),
+  maxBytes: z.number().int().min(1024).max(4 * 1024 * 1024).optional().default(131072)
+});
+
+// The dimension tools (hide/show and the outline groups) address whole
+// rows/columns, so they take a DimensionRange (sheetId + index span) rather
+// than the A1 `range` the cell-oriented tools use. Indices are 0-based and the
+// interval is half-open.
+const dimensionRangeFields = {
+  spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
+  sheetId: z.number().int(),
+  dimension: z.enum(["COLUMNS", "ROWS"]),
+  startIndex: z.number().int().min(0),
+  endIndex: z.number().int().min(0)
+};
+
+const startBeforeEnd = {
+  check: (a: { startIndex: number; endIndex: number }) => a.startIndex < a.endIndex,
+  message: "startIndex must be less than endIndex"
+};
+
+/** Shared by hideSheetDimension, showSheetDimension, addDimensionGroup and deleteDimensionGroup. */
+const DimensionRangeSchema = z.object(dimensionRangeFields)
+  .refine(startBeforeEnd.check, { message: startBeforeEnd.message });
+
+const UpdateDimensionGroupSchema = z.object({
+  ...dimensionRangeFields,
+  depth: z.number().int().min(1, "depth must be at least 1").optional().default(1),
+  collapsed: z.boolean()
+}).refine(startBeforeEnd.check, { message: startBeforeEnd.message });
+
+const ListDimensionGroupsSchema = z.object({
+  spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
+  sheetId: z.number().int().optional()
 });
 
 const FormatGoogleSheetCellsSchema = z.object({
@@ -200,7 +261,7 @@ const AddNamedRangeSchema = z.object({
 const ListGoogleSheetsSchema = z.object({
   maxResults: z.number().int().min(1).max(100).optional().default(20),
   query: z.string().optional(),
-  orderBy: z.enum(["name", "modifiedTime", "createdTime"]).optional().default("modifiedTime")
+  orderBy: z.enum(DRIVE_ORDER_BY_VALUES).optional().default("modifiedTime desc")
 });
 
 const SetColumnWidthSchema = z.object({
@@ -232,149 +293,6 @@ const AutoResizeRowsSchema = z.object({
   startRow: z.number().int().min(0),
   endRow: z.number().int().min(0)
 }).refine(a => a.startRow < a.endRow, { message: "startRow must be less than endRow" });
-
-const HideShowDimensionSchema = z.object({
-  spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
-  sheetId: z.number().int(),
-  dimension: z.enum(["COLUMNS", "ROWS"]),
-  startIndex: z.number().int().min(0),
-  endIndex: z.number().int().min(0)
-}).refine(a => a.startIndex < a.endIndex, { message: "startIndex must be less than endIndex" });
-
-interface BoundedSheetRange {
-  range: string;
-  sheetPrefix: string;
-  startColumn: string;
-  endColumn: string;
-  startRow: number;
-  endRow: number;
-  requestedEndRow?: number;
-  openEnded: boolean;
-}
-
-function boundSheetReadRange(range: string, maxRows: number, maxCells: number): BoundedSheetRange {
-  const bangIndex = range.lastIndexOf('!');
-  const sheetPrefix = bangIndex >= 0 ? range.slice(0, bangIndex + 1) : '';
-  const cellRange = (bangIndex >= 0 ? range.slice(bangIndex + 1) : range).trim();
-  const match = cellRange.match(/^([A-Za-z]+)(\d*)(?::([A-Za-z]+)?(\d*))?$/);
-
-  if (!match) {
-    throw new Error(
-      `Range "${range}" is not a bounded A1 cell range. Use an explicit column range such as ` +
-      `"Sheet1!A1:Z500"; full-row and named ranges are intentionally rejected to prevent oversized responses.`,
-    );
-  }
-
-  const startColumn = match[1].toUpperCase();
-  const startRow = match[2] ? Number(match[2]) : 1;
-  const hasColon = cellRange.includes(':');
-  const endColumn = (match[3] || startColumn).toUpperCase();
-  const requestedEndRow = match[4] ? Number(match[4]) : undefined;
-  const startColumnIndex = colToIndex(startColumn);
-  const endColumnIndex = colToIndex(endColumn);
-
-  if (startColumnIndex < 0 || endColumnIndex < startColumnIndex) {
-    throw new Error(`Invalid or reversed column range: ${startColumn}:${endColumn}`);
-  }
-  if (!Number.isInteger(startRow) || startRow < 1) {
-    throw new Error(`Invalid starting row in range: ${range}`);
-  }
-
-  const columnCount = endColumnIndex - startColumnIndex + 1;
-  const rowsAllowedByCells = Math.floor(maxCells / columnCount);
-  if (rowsAllowedByCells < 1) {
-    throw new Error(
-      `Range ${startColumn}:${endColumn} spans ${columnCount} columns, exceeding maxCells=${maxCells}. ` +
-      `Request fewer columns or raise maxCells (maximum ${MAX_SHEET_READ_CELLS}).`,
-    );
-  }
-
-  const effectiveMaxRows = Math.min(maxRows, rowsAllowedByCells);
-  const singleCell = !hasColon && Boolean(match[2]);
-  const openEnded = !singleCell && requestedEndRow === undefined;
-  const desiredEndRow = singleCell
-    ? startRow
-    : requestedEndRow ?? (startRow + effectiveMaxRows - 1);
-  const endRow = Math.min(desiredEndRow, startRow + effectiveMaxRows - 1);
-
-  if (desiredEndRow < startRow) {
-    throw new Error(`Invalid or reversed row range: ${startRow}:${desiredEndRow}`);
-  }
-
-  return {
-    range: `${sheetPrefix}${startColumn}${startRow}:${endColumn}${endRow}`,
-    sheetPrefix,
-    startColumn,
-    endColumn,
-    startRow,
-    endRow,
-    requestedEndRow,
-    openEnded,
-  };
-}
-
-function validateSheetWritePayload(values: unknown[][], operation: string): string | undefined {
-  const rows = values.length;
-  const cells = values.reduce((total, row) => total + row.length, 0);
-  const bytes = Buffer.byteLength(JSON.stringify(values), 'utf8');
-
-  if (rows > MAX_SHEET_WRITE_ROWS) {
-    return `${operation} contains ${rows} rows; maximum is ${MAX_SHEET_WRITE_ROWS}. Split the write into chunks.`;
-  }
-  if (cells > MAX_SHEET_WRITE_CELLS) {
-    return `${operation} contains ${cells} cells; maximum is ${MAX_SHEET_WRITE_CELLS}. Split the write into chunks.`;
-  }
-  if (bytes > MAX_SHEET_WRITE_BYTES) {
-    return `${operation} payload is ${bytes} bytes; maximum is ${MAX_SHEET_WRITE_BYTES}. Split the write into chunks.`;
-  }
-  return undefined;
-}
-
-function renderSheetRows(
-  values: unknown[][],
-  bounded: BoundedSheetRange,
-  maxOutputChars: number,
-): {
-  text: string;
-  returnedRows: number;
-  returnedCells: number;
-  outputTruncated: boolean;
-} {
-  const heading = `Content for range ${bounded.range}:\n\n`;
-  const summaryReserve = 500;
-  const bodyLimit = Math.max(1, maxOutputChars - summaryReserve);
-  let text = heading;
-  let returnedRows = 0;
-  let returnedCells = 0;
-  let outputTruncated = false;
-
-  for (const row of values) {
-    const rowNumber = bounded.startRow + returnedRows;
-    const cells = row.map((value) => String(value ?? '').replace(/\r?\n/g, '\\n'));
-    const line = `Row ${rowNumber}: ${cells.join(', ')}\n`;
-    if (text.length + line.length > bodyLimit) {
-      outputTruncated = true;
-      if (returnedRows === 0) {
-        const omission =
-          `Row ${rowNumber}: [omitted because this row exceeds maxOutputChars=${maxOutputChars}; ` +
-          `request fewer columns or raise maxOutputChars]\n`;
-        if (text.length + omission.length <= bodyLimit) text += omission;
-        returnedRows = 1;
-        returnedCells = 0;
-      }
-      break;
-    }
-    text += line;
-    returnedRows += 1;
-    returnedCells += row.length;
-  }
-
-  if (values.length === 0) {
-    text += '(empty range)\n';
-  }
-
-  return { text, returnedRows, returnedCells, outputTruncated };
-}
 
 // ---------------------------------------------------------------------------
 // Tool Definitions
@@ -426,18 +344,115 @@ export const toolDefinitions: ToolDefinition[] = [
     }
   },
   {
-    name: "getGoogleSheetContent",
-    description: "Get Google Sheet content using a bounded A1 range. Large reads are limited by rows, cells, and output characters; use nextRange from the response to continue safely.",
+    name: "batchUpdateGoogleSheetValues",
+    description: "Write many ranges in ONE call via spreadsheets.values.batchUpdate. Ranges may sit on different sheets of the same spreadsheet. Prefer this over repeated updateGoogleSheet calls whenever more than one range changes: N separate writes cost N round trips and N units of the per-minute write quota, while one batch costs one of each.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Sheet ID" },
+        updates: {
+          type: "array",
+          description: "Ranges to write, each a {range, values} pair. The API does not document precedence for overlapping ranges, so do not overlap them.",
+          items: {
+            type: "object",
+            properties: {
+              range: { type: "string", description: "Range to update (e.g., 'Sheet1!A1:C10')" },
+              values: {
+                type: "array",
+                description: "2D array of values to write into this range",
+                items: { type: "array", items: { type: "string" } }
+              }
+            },
+            required: ["range", "values"]
+          }
+        },
+        valueInputOption: {
+          type: "string",
+          enum: ["RAW", "USER_ENTERED"],
+          description: "Applies to every range in the batch. RAW (default): values stored exactly as provided - formulas stored as text strings. Safe for untrusted data. USER_ENTERED: values parsed like the spreadsheet UI - formulas (=SUM, =IF, etc.) are evaluated. SECURITY WARNING: USER_ENTERED can execute formulas, only use with trusted data, never with user-provided input that could contain malicious formulas like =IMPORTDATA() or =IMPORTRANGE()."
+        }
+      },
+      required: ["spreadsheetId", "updates"]
+    }
+  },
+  {
+    name: "updateGoogleSheetIfUnchanged",
+    description: "Write cell values only if the guarded area has not changed since you read it, and get back what was overwritten so the change can be undone. Call once with dryRun:true to obtain the fingerprint, then again passing it as expectedFingerprint. IMPORTANT: this is optimistic and NOT atomic. The Sheets API has no compare-and-swap - unlike Docs, where ifRevisionId is enforced by the API itself - so the check happens in this server, and a write landing in the gap between the read and the write (well under a second) is not caught. It catches the case that actually happens: the model changed since you last looked. To undo a write, call again with updates set to the returned preImage and expectedFingerprint set to the returned postFingerprint - nothing else, since guardRanges defaults to the ranges in updates and preImage already carries exactly the ranges that were written. Any cell listed in the returned hazards cannot be restored by feeding preImage back: updates carries strings, so re-writing the string re-interprets it as a formula, a number or a boolean and the cell changes type. Its native userEnteredValue is returned so that you can restore that one cell outside this server - through the Sheets API's own updateCells, or by hand - so an undo that touches a hazard cell needs that cell handled separately. The hazard list is deliberately not exhaustive: text kept as text via a leading apostrophe is only flagged when it reads as a formula, a number, or TRUE/FALSE - date-shaped text (e.g. '2024-01-01') is not detected.",
     inputSchema: {
       type: "object",
       properties: {
         spreadsheetId: { type: "string", description: "Spreadsheet ID" },
-        range: { type: "string", description: "Explicit A1 column/cell range (e.g., 'Sheet1!A1:C10'). Full-row and named ranges are rejected." },
-        maxRows: { type: "number", description: `Maximum rows per call (default ${DEFAULT_SHEET_READ_MAX_ROWS}, max ${MAX_SHEET_READ_ROWS})` },
-        maxCells: { type: "number", description: `Maximum cells per call (default ${DEFAULT_SHEET_READ_MAX_CELLS}, max ${MAX_SHEET_READ_CELLS})` },
-        maxOutputChars: { type: "number", description: `Maximum response characters (default ${DEFAULT_SHEET_READ_MAX_OUTPUT_CHARS}, max ${MAX_SHEET_READ_OUTPUT_CHARS})` },
+        updates: {
+          type: "array",
+          description: "Ranges to write, ValueRange-shaped, same as batchUpdateGoogleSheetValues. Each one must name a bounded rectangle - a single cell, or both corners given as in \"Sheet1!A2:C50\". An open-ended range (\"Sheet1!A2:C\", \"A:C\", \"5:9\") or a bare sheet name is refused, because the returned preImage and postFingerprint would then describe a different area than the one actually written. guardRanges may still be open-ended.",
+          items: {
+            type: "object",
+            properties: {
+              range: { type: "string", description: "A1 range, e.g. \"'Entity Assumptions'!C52:E52\"" },
+              values: { type: "array", description: "Rows of cell values", items: { type: "array", items: { type: "string" } } }
+            },
+            required: ["range", "values"]
+          }
+        },
+        guardRanges: {
+          type: "array",
+          description: "Ranges whose contents must be unchanged. Defaults to the ranges in updates. They need NOT cover the writes - guarding a source block while writing a summary elsewhere is a valid pattern - but then the guard says nothing about what you are overwriting.",
+          items: { type: "string" }
+        },
+        expectedFingerprint: { type: "string", description: "The fingerprint returned by a previous dryRun call. Required unless dryRun is true." },
+        valueInputOption: { type: "string", enum: ["RAW", "USER_ENTERED"], description: "USER_ENTERED (default) parses formulas; RAW stores them as text. SECURITY: USER_ENTERED evaluates formulas, so never use it with untrusted input." },
+        dryRun: { type: "boolean", description: "Write nothing; return the current fingerprint, the guarded contents and what would be written. This is how the first fingerprint is obtained." },
+        maxCells: { type: "number", description: "Budget for the guarded contents returned on a dryRun or a refusal (default 2000)" },
+        maxBytes: { type: "number", description: "Byte budget for the same (default 131072)" }
+      },
+      required: ["spreadsheetId", "updates"]
+    }
+  },
+  {
+    name: "getGoogleSheetContent",
+    description: "Get content of a Google Sheet with cell information. Each row is returned as 'Row N: ' followed by that row's cells separated by tab characters. Returns displayed values by default; set valueRenderOption to 'FORMULA' to read the underlying formulas (e.g. '=SUM(A1:A10)') instead of their results, or 'UNFORMATTED_VALUE' for raw numbers without display formatting. Under UNFORMATTED_VALUE a date or time cell comes back as a spreadsheet serial number (e.g. 45678), not a date string.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        range: { type: "string", description: "Range to get (e.g., 'Sheet1!A1:C10')" },
+        valueRenderOption: {
+          type: "string",
+          description: "How values are returned: FORMATTED_VALUE (as displayed, default), UNFORMATTED_VALUE (raw values; dates and times come back as serial numbers, not date strings), FORMULA (the formula behind each cell)",
+          enum: ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"],
+          default: "FORMATTED_VALUE"
+        }
       },
       required: ["spreadsheetId", "range"]
+    }
+  },
+  {
+    name: "getGoogleSheetCells",
+    description: "Read Google Sheets cells as structured data instead of joined text: each cell comes back with its own absolute A1 address, and with the formula the user entered AND the value it evaluates to, in one call. Reads several ranges at once and returns them separately. Use getGoogleSheetContent for a quick human-readable dump of one range. Use this tool whenever the result will be written back, compared to a formula, or spans several ranges.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        ranges: {
+          type: "array",
+          description: "A1 ranges to read, e.g. [\"'Entity Assumptions'!B52:E52\", \"'Mgmt Fees Calc'!C6:EB13\"]. Returned separately, in this order, each with its own coordinates.",
+          items: { type: "string" }
+        },
+        fields: {
+          type: "array",
+          description: "CellData fields to return. Default ['userEnteredValue','effectiveValue','formattedValue'] gives the formula (userEnteredValue.formulaValue) together with its computed result (effectiveValue, or effectiveValue.errorValue for #REF!/#DIV/0!).",
+          items: { type: "string", enum: [...CELL_FIELDS] }
+        },
+        sheetMetadata: {
+          type: "array",
+          description: "Per-sheet extras returned once per sheet under `sheets`. `merges`, `frozen` and `dimensionGroups` cover the whole sheet (merges are reported at full extent even when they leave the range). `hiddenRows`, `hiddenColumns` and `dimensionSizes` cover only the rows and columns inside the requested ranges.",
+          items: { type: "string", enum: [...SHEET_METADATA] }
+        },
+        includeEmpty: { type: "boolean", description: "Return cells that have none of the requested fields as {a1, empty: true}. Default false - addresses are explicit, so gaps are unambiguous." },
+        maxCells: { type: "number", description: "Cell budget for the whole response (default 2000). On overflow the read stops at a row boundary and returns truncated:true plus nextRanges." },
+        maxBytes: { type: "number", description: "Byte budget for the serialized cells (default 131072), measured on this tool's output. With the default fields, formula-heavy ranges hit this before maxCells, at roughly 1000 cells." }
+      },
+      required: ["spreadsheetId", "ranges"]
     }
   },
   {
@@ -769,6 +784,65 @@ export const toolDefinitions: ToolDefinition[] = [
     }
   },
   {
+    name: "addDimensionGroup",
+    description: "Group a range of rows or columns in a sheet (creates a collapsible outline group). Indices are 0-based and the interval is half-open [startIndex, endIndex) \u2014 to group rows 5 through 12 as shown in the UI, pass startIndex: 4, endIndex: 12. Nest groups by adding a second group inside the range of the first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        sheetId: { type: "number", description: "Sheet ID (from getSpreadsheetInfo / listSheets). The default first sheet is usually 0." },
+        dimension: { type: "string", description: "Group rows or columns", enum: ["ROWS", "COLUMNS"] },
+        startIndex: { type: "number", description: "0-based start index (inclusive)" },
+        endIndex: { type: "number", description: "0-based end index (exclusive); must be greater than startIndex" }
+      },
+      required: ["spreadsheetId", "sheetId", "dimension", "startIndex", "endIndex"]
+    }
+  },
+  {
+    name: "deleteDimensionGroup",
+    description: "Remove a row or column group from a sheet. The rows/columns themselves are kept; only the grouping is removed. Indices are 0-based and the interval is half-open [startIndex, endIndex). Use listDimensionGroups to read back an existing group\u0027s range and pass it in full: the API decrements the group depth of every dimension in the range rather than matching a whole group, so a range that only partially overlaps a group shrinks that group instead of removing it. With a depth-1 group over columns B:E and a depth-2 group over C:D, deleting D:E leaves depth-1 over B:D and depth-2 over C:C.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        sheetId: { type: "number", description: "Sheet ID (from getSpreadsheetInfo / listSheets). The default first sheet is usually 0." },
+        dimension: { type: "string", description: "Group rows or columns", enum: ["ROWS", "COLUMNS"] },
+        startIndex: { type: "number", description: "0-based start index (inclusive)" },
+        endIndex: { type: "number", description: "0-based end index (exclusive); must be greater than startIndex" }
+      },
+      required: ["spreadsheetId", "sheetId", "dimension", "startIndex", "endIndex"]
+    }
+  },
+  {
+    name: "updateDimensionGroup",
+    description: "Collapse or expand an existing row or column group. Indices are 0-based and the interval is half-open [startIndex, endIndex). Use listDimensionGroups first to find the group's range and depth.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        sheetId: { type: "number", description: "Sheet ID (from getSpreadsheetInfo / listSheets). The default first sheet is usually 0." },
+        dimension: { type: "string", description: "Group rows or columns", enum: ["ROWS", "COLUMNS"] },
+        startIndex: { type: "number", description: "0-based start index (inclusive)" },
+        endIndex: { type: "number", description: "0-based end index (exclusive); must be greater than startIndex" },
+        depth: { type: "number", description: "Nesting depth of the group, 1 for an outermost group (default 1)", default: 1 },
+        collapsed: { type: "boolean", description: "true to collapse the group, false to expand it" }
+      },
+      required: ["spreadsheetId", "sheetId", "dimension", "startIndex", "endIndex", "collapsed"]
+    }
+  },
+  {
+    name: "listDimensionGroups",
+    description: "List the row and column groups of a spreadsheet, with each group's range, nesting depth and collapsed state. Ranges are reported as 0-based half-open intervals, exactly as addDimensionGroup, deleteDimensionGroup and updateDimensionGroup take them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string", description: "Spreadsheet ID" },
+        sheetId: { type: "number", description: "Limit to one sheet by ID; omit to list every sheet" }
+      },
+      required: ["spreadsheetId"]
+    }
+  },
+  {
     name: "listGoogleSheets",
     description: "Lists Google Spreadsheets from your Google Drive with optional filtering",
     inputSchema: {
@@ -776,7 +850,7 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         maxResults: { type: "number", description: "Maximum number of spreadsheets to return (1-100)", default: 20 },
         query: { type: "string", description: "Search query to filter spreadsheets by name or content" },
-        orderBy: { type: "string", description: "Sort order for results", enum: ["name", "modifiedTime", "createdTime"], default: "modifiedTime" }
+        orderBy: { type: "string", description: "Sort order for results. Keys without 'desc' sort ascending, so 'modifiedTime' is oldest-first.", enum: [...DRIVE_ORDER_BY_VALUES], default: "modifiedTime desc" }
       },
       required: []
     }
@@ -876,15 +950,21 @@ export const toolDefinitions: ToolDefinition[] = [
 // ---------------------------------------------------------------------------
 
 async function resolveGridRange(
+  ctx: ToolContext,
   sheetsService: ReturnType<ToolContext['google']['sheets']>,
   spreadsheetId: string,
   range: string
 ): Promise<GridRange | string> {
-  const rangeData = await sheetsService.spreadsheets.get({
-    spreadsheetId,
-    ranges: [range],
-    fields: 'sheets(properties(sheetId,title))'
-  });
+  const rangeData = await withRetry(
+    (signal) => sheetsService.spreadsheets.get({
+      spreadsheetId,
+      ranges: [range],
+      fields: 'sheets(properties(sheetId,title))'
+    }, { signal }),
+    ctx.runtimeConfig,
+    'sheets.spreadsheets.get(sheetLookup)',
+    ctx.log
+  );
   const { sheetName, cellRange: a1Range } = parseA1Range(range);
   const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
   if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
@@ -910,10 +990,25 @@ async function batchUpdateOne(
   request: sheets_v4.Schema$Request
 ) {
   const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-  return sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: { requests: [request] },
-  });
+  return withRetry(
+    (signal) => sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [request] },
+    }, { signal }),
+    { ...ctx.runtimeConfig, retryMax: 0 },
+    `sheets.spreadsheets.batchUpdate(${Object.keys(request)[0]})`,
+    ctx.log
+  );
+}
+
+function describeDimensionGroup(
+  label: 'rows' | 'columns',
+  group: sheets_v4.Schema$DimensionGroup
+): string {
+  const start = group.range?.startIndex ?? 0;
+  const end = group.range?.endIndex ?? 0;
+  const depth = group.depth ?? 1;
+  return `  - ${label} [${start}, ${end}), depth ${depth}, ${group.collapsed ? 'collapsed' : 'expanded'}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -932,8 +1027,6 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
-      const payloadError = validateSheetWritePayload(a.data, 'createGoogleSheet');
-      if (payloadError) return errorResponse(payloadError);
 
       const parentFolderId = await ctx.resolveFolderId(a.parentFolderId);
 
@@ -948,37 +1041,52 @@ export async function handleTool(
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
       // Create spreadsheet with initial sheet
-      const spreadsheet = await sheets.spreadsheets.create({
-        requestBody: {
-          properties: { title: a.name },
-          sheets: [{
-            properties: {
-              sheetId: 0,
-              title: 'Sheet1',
-              gridProperties: {
-                rowCount: Math.max(a.data.length, 1000),
-                columnCount: Math.max(a.data[0]?.length || 0, 26)
+      const spreadsheet = await withRetry(
+        (signal) => sheets.spreadsheets.create({
+          requestBody: {
+            properties: { title: a.name },
+            sheets: [{
+              properties: {
+                sheetId: 0,
+                title: 'Sheet1',
+                gridProperties: {
+                  rowCount: Math.max(a.data.length, 1000),
+                  columnCount: Math.max(a.data[0]?.length || 0, 26)
+                }
               }
-            }
-          }]
-        }
-      });
+            }]
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.create',
+        ctx.log
+      );
 
-      await ctx.getDrive().files.update({
-        fileId: spreadsheet.data.spreadsheetId || '',
-        addParents: parentFolderId,
-        removeParents: 'root',
-        fields: 'id, name, webViewLink',
-        supportsAllDrives: true
-      });
+      await withRetry(
+        (signal) => ctx.getDrive().files.update({
+          fileId: spreadsheet.data.spreadsheetId || '',
+          addParents: parentFolderId,
+          removeParents: 'root',
+          fields: 'id, name, webViewLink',
+          supportsAllDrives: true
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'drive.files.update(reparent)',
+        ctx.log
+      );
 
       // Now update with data
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: spreadsheet.data.spreadsheetId!,
-        range: 'Sheet1!A1',
-        valueInputOption: a.valueInputOption || 'RAW',
-        requestBody: { values: a.data }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.values.update({
+          spreadsheetId: spreadsheet.data.spreadsheetId!,
+          range: 'Sheet1!A1',
+          valueInputOption: a.valueInputOption || 'RAW',
+          requestBody: { values: a.data }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.values.update',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Created Google Sheet: ${a.name}\nID: ${spreadsheet.data.spreadsheetId}` }],
@@ -992,19 +1100,315 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
-      const payloadError = validateSheetWritePayload(a.data, 'updateGoogleSheet');
-      if (payloadError) return errorResponse(payloadError);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: a.spreadsheetId,
-        range: a.range,
-        valueInputOption: a.valueInputOption || 'RAW',
-        requestBody: { values: a.data }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.values.update({
+          spreadsheetId: a.spreadsheetId,
+          range: a.range,
+          valueInputOption: a.valueInputOption || 'RAW',
+          requestBody: { values: a.data }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.values.update',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Updated Google Sheet range: ${a.range}` }],
+        isError: false
+      };
+    }
+
+    case "batchUpdateGoogleSheetValues": {
+      const validation = BatchUpdateGoogleSheetValuesSchema.safeParse(args);
+      if (!validation.success) {
+        return errorResponse(validation.error.errors[0].message);
+      }
+      const a = validation.data;
+
+      const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            valueInputOption: a.valueInputOption || 'RAW',
+            data: a.updates
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.values.batchUpdate',
+        ctx.log
+      );
+
+      // Report counts and the ranges touched, never the values back: echoing a
+      // large batch would undo the context saving the batch exists for.
+      const d = response.data;
+      const ranges = (d.responses || [])
+        .map(r => r.updatedRange)
+        .filter((r): r is string => Boolean(r));
+      const rangeList = ranges.length
+        ? ` (${ranges.slice(0, 10).join(', ')}${ranges.length > 10 ? `, +${ranges.length - 10} more` : ''})`
+        : '';
+      // The response carries no range count of its own; one reply per requested
+      // range is the API's contract, so fall back to what we asked for.
+      const rangeCount = d.responses?.length || a.updates.length;
+      return {
+        content: [{
+          type: "text",
+          text: `Updated ${d.totalUpdatedCells ?? 0} cell(s) across ${rangeCount} range(s)${rangeList} in one batch.`
+        }],
+        isError: false
+      };
+    }
+
+    case "updateGoogleSheetIfUnchanged": {
+      const validation = UpdateGoogleSheetIfUnchangedSchema.safeParse(args);
+      if (!validation.success) {
+        return errorResponse(validation.error.errors[0].message);
+      }
+      const a = validation.data;
+
+      // padToDeclaredRange (via blockFromMatch, below) throws when a declared
+      // guard rectangle is absurdly large - see MAX_DECLARED_RECTANGLE_CELLS
+      // in sheetGuard.ts - rather than materializing it. That is a plain,
+      // user-facing "narrow your range" condition, exactly like the
+      // matchRangesToGridData `{error}` case below, so it is turned into an
+      // errorResponse here. Only the two blockFromMatch passes are wrapped,
+      // and nothing else: a catch-all around the whole handler would swallow
+      // every Google API error out of spreadsheets.get too and answer with
+      // the same errorResponse the dispatcher in index.ts already produces -
+      // minus its log() call, which is the only record such a failure leaves.
+      const blocksFor = (matches: RangeMatch[]):
+        { blocks: ReturnType<typeof blockFromMatch>[] } | { error: string } => {
+        try {
+          return { blocks: matches.map(m => blockFromMatch(m)) };
+        } catch (err) {
+          return { error: (err as Error).message };
+        }
+      };
+
+      const guardRanges = guardRangesFor(a.updates, a.guardRanges);
+      const writeRanges = a.updates.map(u => u.range);
+
+      // Before the read, not after it: an unbounded write range can never be
+      // honoured (see checkWriteRanges), so refusing it here costs no API
+      // call at all. dryRun is checked too - a fingerprint taken over such a
+      // request is only ever going to be spent on a write that is refused.
+      const writeRangeProblem = checkWriteRanges(writeRanges);
+      if (writeRangeProblem) return errorResponse(writeRangeProblem);
+
+      // When the guard set is exactly the write set (the common, default
+      // case), reading it twice would ask the API for the same range twice
+      // in one request for no reason - matchRangesToGridData legitimately
+      // hands back one grid entry per requested range, duplicates included,
+      // so a naive concatenation here would double every guarded write's read
+      // for nothing. Collapse to a single read and let guardMatches and
+      // writeMatches both be the one set of matches: the fingerprint is a
+      // pure function of the blocks' contents, titles, origins and
+      // dimensions, never of how many times a range was requested, so the
+      // same sheet state hashes identically whichever branch computed it -
+      // a fingerprint taken by a dryRun (which may take either branch) stays
+      // valid for the write that follows. When the sets genuinely differ,
+      // order and multiplicity must still match what the fingerprint is
+      // computed over, so no deduplication happens there: read guard ranges
+      // then write ranges, in that order, and slice back apart.
+      const sameRanges = guardRanges.length === writeRanges.length
+        && guardRanges.every((r, i) => r === writeRanges[i]);
+      // dryRun never reaches the write (it returns right after the
+      // fingerprint below), so when the guard set is genuinely distinct from
+      // the write set there is nothing to read the write ranges FOR - yet
+      // concatenating them here would still pull every write target out of
+      // Google only to throw the result away, defeating the documented
+      // "guard a source block while writing a summary elsewhere" pattern
+      // (the write targets may not even exist yet). Request only the guard
+      // ranges in that case.
+      const readRanges = sameRanges ? writeRanges
+        : a.dryRun ? guardRanges
+        : [...guardRanges, ...writeRanges];
+
+      const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: readRanges,
+          fields: buildFieldMask(['userEnteredValue'], [])
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(guard)',
+        ctx.log
+      );
+
+      const matched = matchRangesToGridData(readRanges, (response.data.sheets ?? []) as SheetLike[]);
+      if ('error' in matched) return errorResponse(matched.error);
+
+      const guardMatches = sameRanges ? matched.matches : matched.matches.slice(0, guardRanges.length);
+      // When the guard set equals the write set (the default), guardMatches
+      // and writeMatches are literally the same array: computing
+      // blockFromMatch over it once here and again below for the pre-image
+      // would project and pad the identical matches twice. Compute the guard
+      // pass's blocks once and let the write pass reuse them instead of
+      // recomputing; when the sets genuinely differ writeMatches is a
+      // disjoint slice with its own matches, so its own pass is unavoidable
+      // and unaffected.
+      const guardBlocks = blocksFor(guardMatches);
+      if ('error' in guardBlocks) return errorResponse(guardBlocks.error);
+      const guardResults = guardBlocks.blocks;
+      const fingerprint = fingerprintOf(guardResults.map(r => r.block));
+
+      // extractRanges pays a full JSON.stringify + Buffer.byteLength per cell
+      // to build guardContents, which only the dryRun and refusal payloads
+      // below ever read - the success path never touches it. Compute it lazily,
+      // once, only on whichever of those two branches is actually taken.
+      let guardContentsCache: ReturnType<typeof extractRanges> | undefined;
+      const guardContents = () => guardContentsCache ??= extractRanges(guardMatches, ['userEnteredValue'],
+        { maxCells: a.maxCells, maxBytes: a.maxBytes, includeEmpty: false });
+
+      if (a.dryRun) {
+        const cells = a.updates.reduce((n, u) => n + u.values.reduce((m, r) => m + r.length, 0), 0);
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            dryRun: true, fingerprint, guardContents: guardContents(),
+            wouldWrite: { ranges: writeRanges.length, cells }
+          }) }],
+          isError: false
+        };
+      }
+
+      if (fingerprint !== a.expectedFingerprint) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            refused: "fingerprint-mismatch",
+            expectedFingerprint: a.expectedFingerprint,
+            actualFingerprint: fingerprint,
+            guardContents: guardContents()
+          }) }],
+          isError: true
+        };
+      }
+
+      const writeMatches = sameRanges ? matched.matches : matched.matches.slice(guardRanges.length);
+      let writeResults = guardResults;
+      if (!sameRanges) {
+        const writeBlocks = blocksFor(writeMatches);
+        if ('error' in writeBlocks) return errorResponse(writeBlocks.error);
+        writeResults = writeBlocks.blocks;
+      }
+
+      const preImage: PreImageRange[] = [];
+      const hazards: Hazard[] = [];
+      writeResults.forEach(({ block, raw }, i) => {
+        preImage.push(buildPreImage(writeRanges[i], block.cells));
+        hazards.push(...findHazards(block.startRow, block.startColumn, raw));
+      });
+
+      let written;
+      try {
+        written = await withRetry(
+          (signal) => sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId: a.spreadsheetId,
+            requestBody: {
+              valueInputOption: a.valueInputOption,
+              data: a.updates,
+              includeValuesInResponse: true,
+              responseValueRenderOption: 'FORMULA'
+            }
+          }, { signal }),
+          { ...ctx.runtimeConfig, retryMax: 0 },
+          'sheets.spreadsheets.values.batchUpdate(guarded)',
+          ctx.log
+        );
+      } catch (err) {
+        // The request may have reached Google and been applied before the
+        // connection failed or the deadline aborted it - a throw here means
+        // the response never arrived, not that the write didn't happen. preImage and hazards were computed
+        // above, before the call, so they survive regardless: this is the
+        // one thing the tool exists to hand back, and a bare transport error
+        // would discard it exactly when it matters most.
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: "write-outcome-unknown",
+            message: `The request to write to the spreadsheet failed: ${(err as Error).message}. Whether the write was actually applied by Google before the failure is UNKNOWN - the connection broke or the request timed out before a response could be read, so postFingerprint (and an automated rollback keyed on it) is unavailable. Use preImage below to restore the pre-write state if the write did land, or take a fresh dryRun to check the sheet's current state before retrying.`,
+            preImage,
+            hazards
+          }) }],
+          isError: true
+        };
+      }
+
+      // postFingerprint is computed from the write response - there is no
+      // second read. The post-write block has to rest on the SAME geometry as
+      // the guard fingerprint: the declared A1 rectangle, not whatever Google
+      // happened to send back. updatedData.range echoes the DECLARED written
+      // range in full (checked against the live API: writing a single value
+      // into a declared 3x3 range came back with updatedData.range as that
+      // same 3x3, with values trimmed to 1x1), so both the origin and the
+      // dimensions are taken from that string rather than from the preceding
+      // read (writeMatches[i].grid), which may describe a different geometry
+      // when the guard set and the write set differ.
+      const writeResponses = written.data.responses ?? [];
+      const responsesIncomplete = writeResponses.length !== writeMatches.length
+        || writeResponses.some(r => !r.updatedData?.range);
+      if (responsesIncomplete) {
+        // The write has ALREADY happened, so a silent fingerprintOf([]) over a
+        // well-formed but meaningless response would be worse than an honest
+        // failure: it would hand back a postFingerprint against which a later
+        // rollback would either always refuse or - on an accidental match -
+        // roll back the wrong thing. preImage and hazards are already computed
+        // and remain the only way to restore the previous state.
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: "post-write-fingerprint-unavailable",
+            message: "The write to the spreadsheet succeeded, but the API response did not include updatedData.range for every range written, so the post-write state could not be fingerprinted - postFingerprint (and an automated rollback keyed on it) is unavailable. Use preImage below for a manual rollback, or take a fresh dryRun before any further guarded write against these ranges.",
+            written: { ranges: writeRanges.length, cells: written.data.totalUpdatedCells ?? 0 },
+            preImage,
+            hazards
+          }) }],
+          isError: true
+        };
+      }
+
+      // Everything from here on runs AFTER the write has landed, so a throw
+      // that escaped to the caller as a bare error would take preImage and
+      // hazards with it on the one path where they are the only way back.
+      // padToDeclaredRange raises the cell cap over whatever rectangle Google
+      // echoes, which the up-front checkWriteRanges should already have made
+      // unreachable - but the guarantee is worth more than the assumption, so
+      // this block is wrapped exactly as the batchUpdate call above is, and
+      // reports the same "the write happened, the fingerprint did not"
+      // failure the incomplete-response branch does.
+      let postFingerprint: string;
+      try {
+        const postBlocks: CanonicalBlock[] = writeResponses.map((r, i) => {
+          const updatedData = r.updatedData!;
+          const values = (updatedData.values ?? []) as unknown[][];
+          const cells = values.map(row => row.map(v => projectResponseValue(v)));
+          return padToDeclaredRange(updatedData.range!, writeMatches[i]?.sheetTitle ?? '', cells,
+            writeMatches[i]?.grid.startRow ?? 0, writeMatches[i]?.grid.startColumn ?? 0);
+        });
+        postFingerprint = fingerprintOf(postBlocks);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: "post-write-fingerprint-unavailable",
+            message: `The write to the spreadsheet succeeded, but the post-write state could not be fingerprinted: ${(err as Error).message} - postFingerprint (and an automated rollback keyed on it) is unavailable. Use preImage below for a manual rollback, or take a fresh dryRun before any further guarded write against these ranges.`,
+            written: { ranges: writeRanges.length, cells: written.data.totalUpdatedCells ?? 0 },
+            preImage,
+            hazards
+          }) }],
+          isError: true
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          spreadsheetId: a.spreadsheetId,
+          written: { ranges: writeRanges.length, cells: written.data.totalUpdatedCells ?? 0 },
+          fingerprintVerified: fingerprint,
+          postFingerprint,
+          preImage,
+          hazards
+        }) }],
         isError: false
       };
     }
@@ -1015,49 +1419,79 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
-      const bounded = boundSheetReadRange(a.range, a.maxRows, a.maxCells);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       const response = await withRetry(
-        (signal) => sheets.spreadsheets.values.get(
-          {
-            spreadsheetId: a.spreadsheetId,
-            range: bounded.range,
-          },
-          { signal },
-        ),
+        (signal) => sheets.spreadsheets.values.get({
+          spreadsheetId: a.spreadsheetId,
+          range: a.range,
+          valueRenderOption: a.valueRenderOption
+        }, { signal }),
         ctx.runtimeConfig,
-        'sheets.values.get',
-        ctx.log,
+        'sheets.spreadsheets.values.get',
+        ctx.log
       );
 
-      const values = (response.data.values || []) as unknown[][];
-      const rendered = renderSheetRows(values, bounded, a.maxOutputChars);
-      const boundedByRows = bounded.openEnded
-        || (bounded.requestedEndRow !== undefined && bounded.endRow < bounded.requestedEndRow);
-      const hasPotentialNextPage = rendered.outputTruncated
-        || (boundedByRows && values.length >= (bounded.endRow - bounded.startRow + 1));
-      const nextStartRow = bounded.startRow + rendered.returnedRows;
-      const requestedLastRow = bounded.requestedEndRow;
-      const nextEndRow = requestedLastRow === undefined
-        ? nextStartRow + (bounded.endRow - bounded.startRow)
-        : Math.min(
-          requestedLastRow,
-          nextStartRow + (bounded.endRow - bounded.startRow),
-        );
-      const nextRange = hasPotentialNextPage
-        && (requestedLastRow === undefined || nextStartRow <= requestedLastRow)
-          ? `${bounded.sheetPrefix}${bounded.startColumn}${nextStartRow}:${bounded.endColumn}${nextEndRow}`
-          : undefined;
-      const truncated = hasPotentialNextPage || rendered.outputTruncated;
-      let content = rendered.text;
-      content += `\n[Read summary: returnedRows=${rendered.returnedRows}, returnedCells=${rendered.returnedCells}, ` +
-        `fetchedRange=${bounded.range}, truncated=${truncated ? 'yes' : 'no'}`;
-      if (nextRange) content += `, nextRange=${nextRange}`;
-      content += ']';
+      const values = response.data.values || [];
+      let content = `Content for range ${a.range}:\n\n`;
+
+      if (values.length === 0) {
+        content += "(empty range)";
+      } else {
+        values.forEach((row, rowIndex) => {
+          content += `Row ${rowIndex + 1}: ${row.join('\t')}\n`;
+        });
+      }
 
       return {
         content: [{ type: "text", text: content }],
+        isError: false
+      };
+    }
+
+    case "getGoogleSheetCells": {
+      const validation = GetGoogleSheetCellsSchema.safeParse(args);
+      if (!validation.success) {
+        return errorResponse(validation.error.errors[0].message);
+      }
+      const a = validation.data;
+
+      const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
+      // includeGridData is deliberately not passed: a field mask already
+      // selects the grid data, and the flag is ignored when one is present.
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: a.ranges,
+          fields: buildFieldMask(a.fields, a.sheetMetadata)
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(cells)',
+        ctx.log
+      );
+
+      const matched = matchRangesToGridData(a.ranges, (response.data.sheets ?? []) as SheetLike[]);
+      if ('error' in matched) {
+        return errorResponse(matched.error);
+      }
+
+      const extracted = extractRanges(matched.matches, a.fields, {
+        maxCells: a.maxCells, maxBytes: a.maxBytes, includeEmpty: a.includeEmpty
+      });
+      const sheetMeta = collectSheetMetadata(matched.matches, a.sheetMetadata);
+
+      const payload = {
+        spreadsheetId: a.spreadsheetId,
+        spreadsheetTitle: response.data.properties?.title ?? null,
+        results: extracted.results,
+        ...(Object.keys(sheetMeta).length > 0 && { sheets: sheetMeta }),
+        truncated: extracted.truncated,
+        ...(extracted.truncated && { nextRanges: extracted.nextRanges }),
+        returned: extracted.returned
+      };
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
         isError: false
       };
     }
@@ -1072,11 +1506,16 @@ export async function handleTool(
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
       // Parse the range to get sheet ID and grid range
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
 
@@ -1115,10 +1554,15 @@ export async function handleTool(
         }
       }];
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(repeatCell)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Formatted cells in range ${a.range}` }],
@@ -1136,11 +1580,16 @@ export async function handleTool(
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
       // Get sheet information
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
@@ -1196,10 +1645,15 @@ export async function handleTool(
         }
       }];
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(textFormat)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Applied text formatting to range ${a.range}` }],
@@ -1216,11 +1670,16 @@ export async function handleTool(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
@@ -1247,10 +1706,15 @@ export async function handleTool(
         }
       }];
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(numberFormat)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Applied number formatting to range ${a.range}` }],
@@ -1267,11 +1731,16 @@ export async function handleTool(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
@@ -1304,10 +1773,15 @@ export async function handleTool(
       if (a.innerHorizontal) updateBordersRequest.updateBorders.innerHorizontal = border;
       if (a.innerVertical) updateBordersRequest.updateBorders.innerVertical = border;
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests: [updateBordersRequest] }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests: [updateBordersRequest] }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(updateBorders)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Set borders for range ${a.range}` }],
@@ -1324,11 +1798,16 @@ export async function handleTool(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
@@ -1345,10 +1824,15 @@ export async function handleTool(
         }
       }];
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(mergeCells)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Merged cells in range ${a.range} with type ${a.mergeType}` }],
@@ -1365,11 +1849,16 @@ export async function handleTool(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
 
-      const rangeData = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        ranges: [a.range],
-        fields: 'sheets(properties(sheetId,title))'
-      });
+      const rangeData = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          ranges: [a.range],
+          fields: 'sheets(properties(sheetId,title))'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(sheetLookup)',
+        ctx.log
+      );
 
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
@@ -1443,10 +1932,15 @@ export async function handleTool(
         }
       }];
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: { requests }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: { requests }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(conditionalFormat)',
+        ctx.log
+      );
 
       return {
         content: [{ type: "text", text: `Added conditional formatting to range ${a.range}` }],
@@ -1462,10 +1956,15 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const response = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        fields: 'spreadsheetId,properties.title,sheets.properties'
-      });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          fields: 'spreadsheetId,properties.title,sheets.properties'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(info)',
+        ctx.log
+      );
 
       const metadata = response.data;
       let result = `**Spreadsheet Information:**\n\n`;
@@ -1498,17 +1997,20 @@ export async function handleTool(
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
-      const payloadError = validateSheetWritePayload(a.values, 'appendSpreadsheetRows');
-      if (payloadError) return errorResponse(payloadError);
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const response = await sheets.spreadsheets.values.append({
-        spreadsheetId: a.spreadsheetId,
-        range: a.range,
-        valueInputOption: a.valueInputOption || 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: a.values }
-      });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.values.append({
+          spreadsheetId: a.spreadsheetId,
+          range: a.range,
+          valueInputOption: a.valueInputOption || 'USER_ENTERED',
+          insertDataOption: 'INSERT_ROWS',
+          requestBody: { values: a.values }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.values.append',
+        ctx.log
+      );
 
       const updatedCells = response.data.updates?.updatedCells || 0;
       const updatedRows = response.data.updates?.updatedRows || 0;
@@ -1532,18 +2034,23 @@ export async function handleTool(
       const sheetTitle = isAlias ? (validation.data as z.infer<typeof AddSheetSchema>).title : (validation.data as z.infer<typeof AddSpreadsheetSheetSchema>).sheetTitle;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const response = await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [{
-            addSheet: {
-              properties: {
-                title: sheetTitle
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: [{
+              addSheet: {
+                properties: {
+                  title: sheetTitle
+                }
               }
-            }
-          }]
-        }
-      });
+            }]
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(addSheet)',
+        ctx.log
+      );
 
       const addedSheet = response.data.replies?.[0]?.addSheet?.properties;
       if (!addedSheet) {
@@ -1562,10 +2069,15 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const response = await sheets.spreadsheets.get({
-        spreadsheetId: a.spreadsheetId,
-        fields: 'sheets.properties(sheetId,title,index,hidden)'
-      });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          fields: 'sheets.properties(sheetId,title,index,hidden)'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(listSheets)',
+        ctx.log
+      );
 
       const tabs = response.data.sheets || [];
       if (tabs.length === 0) {
@@ -1582,17 +2094,22 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: {
-          requests: [{
-            updateSheetProperties: {
-              properties: { sheetId: a.sheetId, title: a.newTitle },
-              fields: 'title'
-            }
-          }]
-        }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            requests: [{
+              updateSheetProperties: {
+                properties: { sheetId: a.sheetId, title: a.newTitle },
+                fields: 'title'
+              }
+            }]
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(renameSheet)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Renamed sheet ${a.sheetId} to "${a.newTitle}".` }], isError: false };
     }
@@ -1603,14 +2120,19 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: {
-          requests: [{
-            deleteSheet: { sheetId: a.sheetId }
-          }]
-        }
-      });
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            requests: [{
+              deleteSheet: { sheetId: a.sheetId }
+            }]
+          }
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(deleteSheet)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Deleted sheet ${a.sheetId}.` }], isError: false };
     }
@@ -1621,7 +2143,7 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
+      const gridRange = await resolveGridRange(ctx, sheets, a.spreadsheetId, a.range);
       if (typeof gridRange === 'string') return errorResponse(gridRange);
 
       // ONE_OF_RANGE expects a single range formula (leading "="); accept plain
@@ -1630,24 +2152,29 @@ export async function handleTool(
         ? a.values.map(v => ({ userEnteredValue: v.startsWith("=") ? v : `=${v}` }))
         : a.values.map(v => ({ userEnteredValue: v }));
 
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: {
-          requests: [{
-            setDataValidation: {
-              range: gridRange,
-              rule: {
-                condition: {
-                  type: a.conditionType,
-                  values: conditionValues,
+      await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            requests: [{
+              setDataValidation: {
+                range: gridRange,
+                rule: {
+                  condition: {
+                    type: a.conditionType,
+                    values: conditionValues,
+                  },
+                  strict: a.strict,
+                  showCustomUi: a.showCustomUi,
                 },
-                strict: a.strict,
-                showCustomUi: a.showCustomUi,
               },
-            },
-          }],
-        },
-      });
+            }],
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(setDataValidation)',
+        ctx.log
+      );
 
       return { content: [{ type: 'text', text: `Added data validation (${a.conditionType}) to ${a.range}.` }], isError: false };
     }
@@ -1658,23 +2185,28 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
+      const gridRange = await resolveGridRange(ctx, sheets, a.spreadsheetId, a.range);
       if (typeof gridRange === 'string') return errorResponse(gridRange);
 
-      const response = await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: {
-          requests: [{
-            addProtectedRange: {
-              protectedRange: {
-                range: gridRange,
-                description: a.description,
-                warningOnly: a.warningOnly,
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            requests: [{
+              addProtectedRange: {
+                protectedRange: {
+                  range: gridRange,
+                  description: a.description,
+                  warningOnly: a.warningOnly,
+                },
               },
-            },
-          }],
-        },
-      });
+            }],
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(addProtectedRange)',
+        ctx.log
+      );
 
       const protectedRangeId = response.data.replies?.[0]?.addProtectedRange?.protectedRange?.protectedRangeId;
       return { content: [{ type: 'text', text: `Protected range ${a.range}${protectedRangeId ? ` (id: ${protectedRangeId})` : ''}.` }], isError: false };
@@ -1686,25 +2218,116 @@ export async function handleTool(
       const a = validation.data;
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
-      const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
+      const gridRange = await resolveGridRange(ctx, sheets, a.spreadsheetId, a.range);
       if (typeof gridRange === 'string') return errorResponse(gridRange);
 
-      const response = await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: a.spreadsheetId,
-        requestBody: {
-          requests: [{
-            addNamedRange: {
-              namedRange: {
-                name: a.name,
-                range: gridRange,
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.batchUpdate({
+          spreadsheetId: a.spreadsheetId,
+          requestBody: {
+            requests: [{
+              addNamedRange: {
+                namedRange: {
+                  name: a.name,
+                  range: gridRange,
+                },
               },
-            },
-          }],
-        },
-      });
+            }],
+          },
+        }, { signal }),
+        { ...ctx.runtimeConfig, retryMax: 0 },
+        'sheets.spreadsheets.batchUpdate(addNamedRange)',
+        ctx.log
+      );
 
       const namedRangeId = response.data.replies?.[0]?.addNamedRange?.namedRange?.namedRangeId;
       return { content: [{ type: 'text', text: `Added named range "${a.name}" for ${a.range}${namedRangeId ? ` (id: ${namedRangeId})` : ''}.` }], isError: false };
+    }
+
+    case "addDimensionGroup": {
+      const validation = DimensionRangeSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      await batchUpdateOne(ctx, a.spreadsheetId, {
+        addDimensionGroup: {
+          range: dimensionRange(a.sheetId, a.dimension, a.startIndex, a.endIndex),
+        },
+      });
+
+      const label = a.dimension === 'ROWS' ? 'rows' : 'columns';
+      return { content: [{ type: 'text', text: `Grouped ${label} [${a.startIndex}, ${a.endIndex}) on sheet ${a.sheetId}.` }], isError: false };
+    }
+
+    case "deleteDimensionGroup": {
+      const validation = DimensionRangeSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      await batchUpdateOne(ctx, a.spreadsheetId, {
+        deleteDimensionGroup: {
+          range: dimensionRange(a.sheetId, a.dimension, a.startIndex, a.endIndex),
+        },
+      });
+
+      const label = a.dimension === 'ROWS' ? 'rows' : 'columns';
+      return { content: [{ type: 'text', text: `Removed the group on ${label} [${a.startIndex}, ${a.endIndex}) on sheet ${a.sheetId}.` }], isError: false };
+    }
+
+    case "updateDimensionGroup": {
+      const validation = UpdateDimensionGroupSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      await batchUpdateOne(ctx, a.spreadsheetId, {
+        updateDimensionGroup: {
+          dimensionGroup: {
+            range: dimensionRange(a.sheetId, a.dimension, a.startIndex, a.endIndex),
+            depth: a.depth,
+            collapsed: a.collapsed,
+          },
+          fields: 'collapsed',
+        },
+      });
+
+      const label = a.dimension === 'ROWS' ? 'rows' : 'columns';
+      return { content: [{ type: 'text', text: `${a.collapsed ? 'Collapsed' : 'Expanded'} the group on ${label} [${a.startIndex}, ${a.endIndex}) at depth ${a.depth} on sheet ${a.sheetId}.` }], isError: false };
+    }
+
+    case "listDimensionGroups": {
+      const validation = ListDimensionGroupsSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
+      const response = await withRetry(
+        (signal) => sheets.spreadsheets.get({
+          spreadsheetId: a.spreadsheetId,
+          fields: 'sheets(properties(sheetId,title),rowGroups,columnGroups)'
+        }, { signal }),
+        ctx.runtimeConfig,
+        'sheets.spreadsheets.get(dimensionGroups)',
+        ctx.log
+      );
+
+      const allSheets = response.data.sheets || [];
+      const targets = a.sheetId === undefined
+        ? allSheets
+        : allSheets.filter(s => s.properties?.sheetId === a.sheetId);
+      if (a.sheetId !== undefined && targets.length === 0) {
+        return errorResponse(`Sheet with id ${a.sheetId} not found`);
+      }
+
+      const blocks = targets.map(sheet => {
+        const lines = [
+          ...(sheet.rowGroups || []).map(g => describeDimensionGroup('rows', g)),
+          ...(sheet.columnGroups || []).map(g => describeDimensionGroup('columns', g)),
+        ];
+        const body = lines.length > 0 ? lines.join('\n') : '  (no groups)';
+        return `**${sheet.properties?.title || 'Untitled'}** (sheetId: ${sheet.properties?.sheetId})\n${body}`;
+      });
+
+      return { content: [{ type: 'text', text: blocks.join('\n\n') }], isError: false };
     }
 
     case "listGoogleSheets": {
@@ -1720,13 +2343,18 @@ export async function handleTool(
         queryString += ` and (name contains '${escapedQuery}' or fullText contains '${escapedQuery}')`;
       }
 
-      const response = await ctx.getDrive().files.list({
-        q: queryString,
-        pageSize: a.maxResults || 20,
-        orderBy: a.orderBy === 'name' ? 'name' : a.orderBy,
-        fields: 'files(id,name,modifiedTime,createdTime,webViewLink,owners(displayName,emailAddress))',
-        ...ALL_DRIVES_LIST_PARAMS
-      });
+      const response = await withRetry(
+        (signal) => ctx.getDrive().files.list({
+          q: queryString,
+          pageSize: a.maxResults || 20,
+          orderBy: a.orderBy,
+          fields: 'files(id,name,modifiedTime,createdTime,webViewLink,owners(displayName,emailAddress))',
+          ...ALL_DRIVES_LIST_PARAMS
+        }, { signal }),
+        ctx.runtimeConfig,
+        'drive.files.list',
+        ctx.log
+      );
 
       const files = response.data.files || [];
       if (files.length === 0) {
@@ -1736,7 +2364,7 @@ export async function handleTool(
         };
       }
 
-      let result = `Found ${files.length} Google Spreadsheet(s):\n\n`;
+      let result = `Found ${files.length} Google Spreadsheet(s) (ordered by ${a.orderBy}):\n\n`;
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const modifiedDate = file.modifiedTime ? new Date(file.modifiedTime).toLocaleDateString() : 'Unknown';
@@ -1816,7 +2444,7 @@ export async function handleTool(
 
     case "hideSheetDimension":
     case "showSheetDimension": {
-      const validation = HideShowDimensionSchema.safeParse(args);
+      const validation = DimensionRangeSchema.safeParse(args);
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const a = validation.data;
       const hide = toolName === 'hideSheetDimension';

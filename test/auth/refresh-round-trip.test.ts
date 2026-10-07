@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { AccountStore } from '../../src/auth/accountStore.js';
 import { AccountClientFactory } from '../../src/auth/accountClientFactory.js';
-import type { AccountRecord } from '../../src/auth/types.js';
+import type { AccountRecord, TokenFileV2 } from '../../src/auth/types.js';
+import {
+  installFakeTokenEndpoint,
+  stallThen,
+  stallUntilAborted,
+  tokenResponse,
+} from '../helpers/fake-token-endpoint.js';
 
 // ---------------------------------------------------------------------------
 // Token-refresh round-trip.
@@ -81,8 +87,11 @@ function makeRecord(overrides: Partial<AccountRecord> = {}): AccountRecord {
   };
 }
 
-/** Wait until `predicate()` returns truthy or `timeoutMs` elapses. Generous
- * default: under full-suite parallel load, 2s was routinely exceeded. */
+/** Wait until `predicate()` returns truthy or `timeoutMs` elapses. Several
+ * callers poll the on-disk token file, which AccountClientFactory's `'tokens'`
+ * listener writes asynchronously and fire-and-forget (see persistRefreshedTokens
+ * in accountClientFactory.ts); the generous default accounts for real disk I/O
+ * latency under a loaded machine, not for any in-memory visibility delay. */
 async function waitFor(
   predicate: () => boolean | Promise<boolean>,
   timeoutMs = 10_000,
@@ -93,6 +102,16 @@ async function waitFor(
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+}
+
+/** Read and parse the token file, tolerating "not written yet". */
+async function readTokenFile(tokenPath: string): Promise<TokenFileV2 | undefined> {
+  try {
+    return JSON.parse(await fs.readFile(tokenPath, 'utf-8')) as TokenFileV2;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
 }
 
 test('factory persists new access_token from a "tokens" event into AccountStore', async () => {
@@ -115,7 +134,10 @@ test('factory persists new access_token from a "tokens" event into AccountStore'
       // No refresh_token — must NOT clobber the existing one.
     });
 
-    await waitFor(() => store.get('work')?.accessToken === newAccess);
+    await waitFor(async () => {
+      const onDisk = await readTokenFile(tokenPath);
+      return onDisk?.accounts?.work?.accessToken === newAccess;
+    });
 
     const updated = store.get('work')!;
     assert.equal(updated.accessToken, newAccess);
@@ -124,13 +146,9 @@ test('factory persists new access_token from a "tokens" event into AccountStore'
     assert.notEqual(updated.lastRefreshedAt, makeRecord().lastRefreshedAt);
 
     // File on disk reflects the change too.
-    await waitFor(async () => {
-      const persisted = JSON.parse(await fs.readFile(tokenPath, 'utf-8'));
-      return persisted.accounts.work.accessToken === newAccess;
-    });
-    const onDisk = JSON.parse(await fs.readFile(tokenPath, 'utf-8'));
-    assert.equal(onDisk.accounts.work.accessToken, newAccess);
-    assert.equal(onDisk.accounts.work.refreshToken, 'persistent-refresh');
+    const onDisk = await readTokenFile(tokenPath);
+    assert.equal(onDisk?.accounts.work?.accessToken, newAccess);
+    assert.equal(onDisk?.accounts.work?.refreshToken, 'persistent-refresh');
   } finally {
     await cleanup();
   }
@@ -152,8 +170,16 @@ test('factory accepts a rotated refresh_token when Google does send one', async 
       expiry_date: Date.now() + 3600_000,
     });
 
-    await waitFor(() => store.get('work')?.refreshToken === 'rotated-refresh');
+    await waitFor(async () => {
+      const onDisk = await readTokenFile(tokenPath);
+      return onDisk?.accounts?.work?.refreshToken === 'rotated-refresh';
+    });
     assert.equal(store.get('work')!.accessToken, 'rotated-access');
+
+    // File on disk reflects the rotated token too.
+    const onDisk = await readTokenFile(tokenPath);
+    assert.equal(onDisk?.accounts.work?.accessToken, 'rotated-access');
+    assert.equal(onDisk?.accounts.work?.refreshToken, 'rotated-refresh');
   } finally {
     await cleanup();
   }
@@ -240,6 +266,137 @@ test('factory surfaces invalid_grant as an actionable reconnect error (finding 5
       },
     );
   } finally {
+    await cleanup();
+  }
+});
+
+test('factory detects invalid_grant in the gaxios-7 error shape', async () => {
+  const { tokenPath, cleanup } = await setupTmpCredentials();
+  try {
+    const store = new AccountStore({ filePath: tokenPath, mode: 'local-oauth' });
+    await store.reload();
+    await store.upsert(makeRecord({ expiryDate: Date.now() + 3600_000 }));
+
+    const factory = new AccountClientFactory(store);
+    const client = await factory.getClient('work');
+
+    client.setCredentials({ ...client.credentials, expiry_date: Date.now() - 60_000 });
+    (client as unknown as { refreshAccessToken: () => Promise<never> }).refreshAccessToken =
+      async () => {
+        // gaxios 7 sets a top-level numeric `status` and still parses the
+        // OAuth error body into response.data.
+        const err = new Error('Request failed with status code 400') as Error & {
+          status?: number;
+          response?: { status?: number; data?: { error?: string; error_description?: string } };
+        };
+        err.status = 400;
+        err.response = {
+          status: 400,
+          data: { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' },
+        };
+        throw err;
+      };
+
+    await assert.rejects(
+      () => factory.getClient('work'),
+      (err: Error) => {
+        assert.match(err.message, /revoked or has expired/);
+        assert.match(err.message, /manage_accounts add work/);
+        return true;
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bounded refresh through the factory (#169). The fake endpoint replaces the
+// network under the REAL refreshAccessToken() path, so the factory's dedupe
+// map, the retry, the abort of the stalled POST and the 'tokens' persistence
+// are all exercised together.
+// ---------------------------------------------------------------------------
+
+const BOUNDED = { tokenRefreshTimeout: 30, retryMax: 1, retryBaseDelay: 0 };
+
+test('a stalled refresh fails every deduped caller fast with an actionable error', async () => {
+  const { tokenPath, cleanup } = await setupTmpCredentials();
+  const logged: string[] = [];
+  const errMock = mock.method(console, 'error', (...args: unknown[]) => {
+    logged.push(args.map(String).join(' '));
+  });
+  try {
+    const store = new AccountStore({ filePath: tokenPath, mode: 'local-oauth' });
+    await store.reload();
+    await store.upsert(makeRecord());
+
+    const factory = new AccountClientFactory(store, BOUNDED);
+    const client = await factory.getClient('work');
+    client.setCredentials({ ...client.credentials, expiry_date: Date.now() - 60_000 });
+    const endpoint = installFakeTokenEndpoint(client, stallUntilAborted);
+
+    const start = Date.now();
+    const results = await Promise.allSettled([factory.getClient('work'), factory.getClient('work')]);
+    assert.ok(Date.now() - start < 2_000, 'callers were not released promptly');
+    for (const r of results) {
+      assert.equal(r.status, 'rejected');
+      const message = (r as PromiseRejectedResult).reason.message as string;
+      assert.match(message, /Account 'work' could not refresh its access token/);
+      assert.match(message, /did not respond within 30ms/);
+      assert.match(message, /--token-refresh-timeout/);
+    }
+    // One deduped refresh: two attempts, each a distinct aborted POST.
+    assert.equal(endpoint.calls.length, 2);
+    assert.ok(endpoint.calls.every((c) => c.signal?.aborted));
+    assert.equal(
+      (factory as unknown as { inflightRefresh: Map<string, unknown> }).inflightRefresh.size,
+      0,
+      'inflight map must clear after a timeout',
+    );
+    // The retry log names the operation but never the token material.
+    const retryLine = logged.find((l) => l.includes('retry 1/1'));
+    assert.ok(retryLine, `expected a retry log line, got: ${JSON.stringify(logged)}`);
+    assert.ok(!logged.join('\n').includes('persistent-refresh'), 'refresh token leaked into logs');
+
+    // Endpoint recovers: the next call retries from scratch and persists.
+    endpoint.handler = tokenResponse('new-access');
+    const again = await factory.getClient('work');
+    assert.equal(again, client, 'a timeout must not evict the cached client');
+    assert.equal(again.credentials.access_token, 'new-access');
+    await waitFor(async () => {
+      const onDisk = await readTokenFile(tokenPath);
+      return onDisk?.accounts?.work?.accessToken === 'new-access';
+    });
+    assert.equal(store.get('work')!.refreshToken, 'persistent-refresh');
+    assert.equal((await readTokenFile(tokenPath))?.accounts.work?.refreshToken, 'persistent-refresh');
+  } finally {
+    errMock.mock.restore();
+    await cleanup();
+  }
+});
+
+test('a transient stall recovers on the retry and the caller never sees an error', async () => {
+  const { tokenPath, cleanup } = await setupTmpCredentials();
+  const errMock = mock.method(console, 'error', () => {});
+  try {
+    const store = new AccountStore({ filePath: tokenPath, mode: 'local-oauth' });
+    await store.reload();
+    await store.upsert(makeRecord());
+
+    const factory = new AccountClientFactory(store, BOUNDED);
+    const client = await factory.getClient('work');
+    client.setCredentials({ ...client.credentials, expiry_date: Date.now() - 60_000 });
+    const endpoint = installFakeTokenEndpoint(client, stallThen(tokenResponse('new-access')));
+
+    await factory.getClient('work');
+    assert.equal(client.credentials.access_token, 'new-access');
+    assert.equal(endpoint.calls.length, 2);
+    await waitFor(async () => {
+      const onDisk = await readTokenFile(tokenPath);
+      return onDisk?.accounts?.work?.accessToken === 'new-access';
+    });
+  } finally {
+    errMock.mock.restore();
     await cleanup();
   }
 });

@@ -90,6 +90,25 @@ function log(message: string, data?: any) {
   console.error(logMessage);
 }
 
+/** ctx.log for team mode — always attributes the log to the acting user by
+ * merging `userId` (the Google sub) and, when known, `email` into the data
+ * payload. Non-plain-object payloads (array, string, number) are wrapped so
+ * the attribution is never lost. Errors are rendered via describeErrorForLog:
+ * JSON.stringify(new Error(...)) is `{}` (message lost), and a raw gaxios
+ * error's enumerable request config can carry token material. */
+function logWithUser(userId: string, email?: string): (message: string, data?: any) => void {
+  const who = email ? { userId, email } : { userId };
+  return (message: string, data?: any) => {
+    if (data instanceof Error) {
+      log(message, { error: describeErrorForLog(data), ...who });
+    } else if (data && typeof data === 'object' && !Array.isArray(data)) {
+      log(message, { ...data, ...who });
+    } else {
+      log(message, { data, ...who });
+    }
+  };
+}
+
 const runtimeConfig = loadRuntimeConfig();
 log('Runtime config:', runtimeConfig);
 const toolLimiter = new ToolConcurrencyLimiter(
@@ -112,7 +131,7 @@ async function ensureAuthSystem(): Promise<AuthSystem> {
   }
 
   log('Initializing authentication');
-  authSystemPromise = buildAuthSystem();
+  authSystemPromise = buildAuthSystem({ tokenRefresh: runtimeConfig });
   try {
     authSystem = await authSystemPromise;
     log('Authentication complete');
@@ -171,6 +190,18 @@ async function getCalendarFor(account: AccountRecord): Promise<calendar_v3.Calen
 async function getAuthClientFor(account: AccountRecord): Promise<any> {
   const sys = requireAuthSystem();
   return sys.factory.getClient(account.alias);
+}
+
+/**
+ * Drop every client cached for `alias` — the factory's OAuth2Client plus the
+ * Drive and Calendar services built on it. Call whenever the alias's grant
+ * changes (removal, or a re-consent that supersedes the old tokens) so the next
+ * call rebuilds from the current record instead of a revoked one.
+ */
+function evictAccountClients(alias: string): void {
+  requireAuthSystem().factory.evict(alias);
+  _driveByAlias.delete(alias);
+  _calendarByAlias.delete(alias);
 }
 
 // -----------------------------------------------------------------------------
@@ -263,6 +294,11 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
           pendingIdentity,
         };
         await sys.store.upsert(record);
+        // A re-consent supersedes the grant every cached client for this alias
+        // was built from (issue #168): without this the factory keeps handing
+        // out the old — possibly revoked — OAuth2Client, and the cached Drive
+        // and Calendar services stay bound to it, until the server restarts.
+        evictAccountClients(alias);
         // Make it the default if it's the first account.
         if (!sys.store.getDefault()) {
           await sys.store.setDefault(alias);
@@ -313,9 +349,7 @@ async function removeAccountFlow(alias: string): Promise<void> {
     throw new Error(`No account with alias "${alias}".`);
   }
   await sys.store.remove(alias);
-  sys.factory.evict(alias);
-  _driveByAlias.delete(alias);
-  _calendarByAlias.delete(alias);
+  evictAccountClients(alias);
 }
 
 async function setDefaultAccountFlow(alias: string | null): Promise<void> {
@@ -465,6 +499,44 @@ function withAccountParam(def: { name: string; description: string; inputSchema:
   };
 }
 
+// MCP tool annotations are hints a client can use to decide whether a call needs
+// a confirmation prompt. The spec defaults `destructiveHint` to true, so a
+// server that annotates nothing has every tool treated as destructive —
+// `search` and `readGoogleDoc` indistinguishable from `deleteItem`. Projecting
+// the read/write/admin classification the account resolver already relies on
+// costs nothing and corrects exactly that.
+//
+// Only `readOnlyHint` is emitted. Marking additive writes (`insertText`,
+// `addComment`) non-destructive takes a per-tool judgement across 92 tools, and
+// a wrong call there suppresses a confirmation prompt that should have fired.
+// The spec default of `true` is the safe posture until that pass happens.
+//
+// Per the spec, clients must treat annotations from an untrusted server as
+// untrusted, so these improve UX in cooperating clients rather than enforcing
+// anything.
+//
+// `opKind` answers "which Google scope does this need", not "does this mutate
+// anything", so it is corrected at the edges: `downloadFile` is a Drive read
+// that writes (and with `overwrite` replaces) a file on the host, and the auth
+// diagnostics are admin-dispatched but only ever read.
+const HOST_MUTATING_READS: ReadonlySet<string> = new Set(['downloadFile']);
+const READ_ONLY_ADMIN_TOOLS: ReadonlySet<string> = new Set([
+  'authGetStatus',
+  'authListScopes',
+  'authTestFileAccess',
+]);
+
+function isReadOnlyTool(name: string): boolean {
+  if (HOST_MUTATING_READS.has(name)) return false;
+  if (READ_ONLY_ADMIN_TOOLS.has(name)) return true;
+  return TOOL_META[name]?.opKind === 'read';
+}
+
+function withAnnotations<T extends { name: string }>(def: T): T {
+  if (!isReadOnlyTool(def.name)) return def;
+  return { ...def, annotations: { readOnlyHint: true } };
+}
+
 function normalizeAccountArg(raw: unknown): string | undefined {
   // `null`/`undefined`/empty → "not provided" (resolve against the default).
   // Check null first: `typeof null === 'object'` would otherwise fall into the
@@ -592,7 +664,9 @@ async function handleTeamToolCall(
 ): Promise<ToolResult> {
   const runtime = teamRuntime!;
   const sub = extra?.authInfo?.extra?.sub;
-  log('Handling tool request (team)', { tool: toolName });
+  const rawEmail = extra?.authInfo?.extra?.email;
+  const email = typeof rawEmail === 'string' ? rawEmail : undefined;
+  log('Handling tool request (team)', { tool: toolName, sub, email });
   try {
     if (typeof sub !== 'string' || sub.length === 0) {
       // requireBearerAuth guarantees an identity on every /mcp request;
@@ -650,14 +724,14 @@ async function handleTeamToolCall(
     }
 
     const sessionId = extra?.sessionId ?? STDIO_SESSION_ID;
-    const ctx = await buildTeamToolContext(sessionId, sub);
+    const ctx = await buildTeamToolContext(sessionId, sub, email);
     for (const mod of domainModules) {
       const result = await mod.handleTool(toolName, rawArgs, ctx);
       if (result !== null) return result;
     }
     return errorResponse('Tool not found');
   } catch (error) {
-    log('Error in team tool request handler', { error: (error as Error).message });
+    log('Error in team tool request handler', { error: (error as Error).message, sub, email });
     return errorResponse((error as Error).message);
   }
 }
@@ -667,7 +741,11 @@ async function handleTeamToolCall(
  * per-sub TeamClientFactory, and the multi-account surface is stubbed to fail
  * loudly — in team mode there is exactly one identity per request.
  */
-async function buildTeamToolContext(sessionId: string, sub: string): Promise<ToolContext> {
+async function buildTeamToolContext(
+  sessionId: string,
+  sub: string,
+  email?: string,
+): Promise<ToolContext> {
   const runtime = teamRuntime!;
   const drive = await runtime.clientFactory.getDrive(sub);
   const calendar = await runtime.clientFactory.getCalendar(sub);
@@ -682,12 +760,13 @@ async function buildTeamToolContext(sessionId: string, sub: string): Promise<Too
     google,
     getDrive: () => drive,
     getCalendar: () => calendar,
-    log,
+    log: logWithUser(sub, email),
     resolvePath: (pathStr) => resolvePath(pathStr, drive),
     resolveFolderId: (input) => resolveFolderId(input, drive),
     checkFileExists: (name, parentFolderId) => checkFileExists(name, parentFolderId, drive),
     validateTextFileExtension,
     runtimeConfig,
+    userId: sub,
 
     sessionId,
     resolveAccount: async () => {
@@ -750,12 +829,12 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
       // single-user auth tools are hidden too (they report the server's
       // tokens.json state, which is meaningless for an OAuth-signed-in member).
       return {
-        tools: definitions.filter(
-          (d) => d.name !== 'manage_accounts' && !TEAM_HIDDEN_TOOLS.has(d.name),
-        ),
+        tools: definitions
+          .filter((d) => d.name !== 'manage_accounts' && !TEAM_HIDDEN_TOOLS.has(d.name))
+          .map(withAnnotations),
       };
     }
-    return { tools: definitions.map(withAccountParam) };
+    return { tools: definitions.map(withAccountParam).map(withAnnotations) };
   });
 
   s.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -981,6 +1060,9 @@ Options:
                              tools stay available. Bare flag disables; --no-resources=false
                              re-enables (overrides a truthy GOOGLE_DRIVE_MCP_DISABLE_RESOURCES).
   --api-timeout=<ms>         Per-request API timeout in ms; 0 disables (default: 120000)
+  --token-refresh-timeout=<ms>
+                             Per-attempt OAuth token refresh timeout in ms; 0 disables
+                             (default: 15000). A refresh is retried at most once.
   --retry-max=<n>            Max retry attempts on transient failures; 0 disables (default: 3)
   --retry-base-delay=<ms>    Base delay for retry backoff in ms (default: 1000)
   --max-concurrent-tools=<n> Maximum tool calls running at once; 0 disables the limit (default: 8)
@@ -1047,7 +1129,7 @@ async function runAuthServer(alias?: string): Promise<void> {
     // Assemble the multi-account system WITHOUT the empty-store first-time flow, so
     // the CLI drives a single additive consent below. This never flat-overwrites a
     // populated tokens.json — the pre-fix legacy path wiped every other account.
-    authSystem = await buildAuthSystem({ interactiveIfEmpty: false });
+    authSystem = await buildAuthSystem({ interactiveIfEmpty: false, tokenRefresh: runtimeConfig });
     const sys = requireAuthSystem();
 
     if (sys.mode !== 'local-oauth') {
@@ -1066,7 +1148,7 @@ async function runAuthServer(alias?: string): Promise<void> {
     // onTokens callback persists the account as 'default' directly into the v2
     // store. Safe: the store is empty here, so there is nothing to overwrite.
     if (sys.store.list().length === 0 && RESERVED_ALIASES.has(target)) {
-      authSystem = await buildAuthSystem();
+      authSystem = await buildAuthSystem({ tokenRefresh: runtimeConfig });
       const created = requireAuthSystem().store.getDefault() ?? 'default';
       console.log(`Authentication successful. Account '${created}' is ready.`);
       process.exit(0);
@@ -1260,6 +1342,9 @@ interface HttpSession {
   /** Team mode: the Google sub the session was initialized by. Every later
    * request must present a bearer for the same user (session hijack guard). */
   sub?: string;
+  /** Team mode: that user's email at session creation. Log attribution only —
+   * authorization always binds to `sub`. */
+  email?: string;
 }
 
 /**
@@ -1376,7 +1461,10 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
     sessionTimers.set(sid, setTimeout(async () => {
       const session = sessions.get(sid);
       if (session) {
-        log(`Session idle timeout: ${sid}`);
+        log(
+          `Session idle timeout: ${sid}`,
+          session.sub ? { sub: session.sub, email: session.email } : undefined,
+        );
         await session.transport.close();
         await session.server.close();
         sessions.delete(sid);
@@ -1384,6 +1472,40 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       }
       sessionTimers.delete(sid);
     }, idleTimeoutMs));
+  }
+
+  /**
+   * Reject a request that did not reach a live session of the caller's.
+   *
+   * Streamable HTTP distinguishes the two cases: a request that presents an
+   * `Mcp-Session-Id` the server no longer knows (evicted, closed, or never
+   * issued) gets 404 so the client starts a new session with `initialize`,
+   * whereas a request that omits the header where one is required gets 400.
+   * Answering an expired session with 400 leaves compliant clients stuck,
+   * failing every call until the user reconnects by hand. The 404 body uses
+   * the SDK's own code and message so clients see one shape either way.
+   *
+   * Team mode routes a foreign user's session id through the same 404 as an
+   * unknown one, so the id's existence cannot be probed.
+   */
+  function rejectSession(
+    res: { status(code: number): { json(body: unknown): unknown } },
+    sessionId: string | undefined,
+    missingHeaderMessage: string,
+  ): void {
+    if (sessionId) {
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found' },
+        id: null,
+      });
+      return;
+    }
+    res.status(400).json({
+      jsonrpc: '2.0',
+      error: { code: -32600, message: missingHeaderMessage },
+      id: null,
+    });
   }
 
   function clearSessionTimer(sid: string) {
@@ -1394,35 +1516,13 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
     }
   }
 
-  function rejectMissingOrUnknownSession(
-    res: Response,
-    sessionId: string | undefined,
-  ): void {
-    if (sessionId) {
-      // Streamable HTTP requires 404 for a session that no longer exists so
-      // clients discard the stale ID and initialize a replacement session.
-      res.status(404).json({
-        jsonrpc: '2.0',
-        error: { code: -32001, message: 'Session not found' },
-        id: null,
-      });
-      return;
-    }
-
-    res.status(400).json({
-      jsonrpc: '2.0',
-      error: { code: -32600, message: 'Bad Request: missing session ID' },
-      id: null,
-    });
-  }
-
   app.post('/mcp', ...mcpGuards, async (req, res) => {
     try {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
       // If we have an existing session owned by this caller, delegate to it.
       // A foreign user presenting a leaked session id falls through and gets
-      // the same 400 as an unknown session.
+      // the same 404 as an unknown session.
       const existingSession = sessionId ? sessions.get(sessionId) : undefined;
       if (existingSession && sessionBelongsToCaller(existingSession, req)) {
         resetSessionTimer(sessionId!);
@@ -1430,18 +1530,11 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         return;
       }
 
-      // New session: only accept initialize requests. A supplied but unknown
-      // session ID is a terminated session and must return 404, not 400.
+      // New session: only accept initialize requests. A stale session id on an
+      // initialize is tolerated so a client recovering from a 404 does not
+      // have to scrub the header first.
       if (!isInitializeRequest(req.body)) {
-        if (sessionId) {
-          rejectMissingOrUnknownSession(res, sessionId);
-          return;
-        }
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32600, message: 'Bad Request: expected initialize request or valid session ID' },
-          id: null,
-        });
+        rejectSession(res, sessionId, 'Bad Request: expected initialize request or valid session ID');
         return;
       }
 
@@ -1472,10 +1565,14 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       transport.onclose = () => {
         const sid = transport.sessionId;
         if (sid) {
+          const closed = sessions.get(sid);
           clearSessionTimer(sid);
           sessions.delete(sid);
           if (authSystem) authSystem.sessions.delete(sid);
-          log(`Session closed: ${sid}`);
+          log(
+            `Session closed: ${sid}`,
+            closed?.sub ? { sub: closed.sub, email: closed.email } : undefined,
+          );
         }
       };
 
@@ -1483,14 +1580,20 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
 
       const sid = transport.sessionId;
       if (sid) {
+        const sessionSub = teamAuth ? (req.auth?.extra?.sub as string | undefined) : undefined;
+        const sessionEmail = teamAuth ? (req.auth?.extra?.email as string | undefined) : undefined;
         sessions.set(sid, {
           transport,
           server: sessionServer,
-          sub: teamAuth ? (req.auth?.extra?.sub as string | undefined) : undefined,
+          sub: sessionSub,
+          email: sessionEmail,
         });
         resetSessionTimer(sid);
         if (authSystem) authSystem.sessions.getOrCreate(sid);
-        log(`New session created: ${sid}`);
+        log(
+          `New session created: ${sid}`,
+          sessionSub ? { sub: sessionSub, email: sessionEmail } : undefined,
+        );
       }
     } catch (error) {
       log('Error handling POST /mcp', { error: (error as Error).message });
@@ -1509,7 +1612,7 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!session || !sessionBelongsToCaller(session, req)) {
-        rejectMissingOrUnknownSession(res, sessionId);
+        rejectSession(res, sessionId, 'Bad Request: Mcp-Session-Id header is required');
         return;
       }
       resetSessionTimer(sessionId!);
@@ -1531,7 +1634,7 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!session || !sessionBelongsToCaller(session, req)) {
-        rejectMissingOrUnknownSession(res, sessionId);
+        rejectSession(res, sessionId, 'Bad Request: Mcp-Session-Id header is required');
         return;
       }
       await session.transport.close();
@@ -1567,7 +1670,7 @@ async function startHttpTransport(args: CliArgs): Promise<void> {
         console.error(`Team mode configuration error: ${(err as Error).message}`);
         process.exit(1);
       }
-      teamRuntime = await createTeamRuntime(teamConfig);
+      teamRuntime = await createTeamRuntime(teamConfig, { tokenRefresh: runtimeConfig });
       // Print every derived URL so a proxy/issuer misconfiguration is
       // debuggable from the startup log alone.
       console.error(
@@ -1677,6 +1780,35 @@ export function _setAuthClientForTesting(client: any) {
  */
 export function _getAuthSystemForTesting(): AuthSystem | null {
   return authSystem;
+}
+
+/**
+ * Install (or clear) an arbitrary AuthSystem for testing, and drop every cached
+ * Drive/Calendar service so the next call rebuilds through the new system.
+ *
+ * `_setAuthClientForTesting` always builds a `mode: 'test'` system, which makes
+ * the account-lifecycle flows unreachable (they short-circuit in
+ * `requireLocalOAuthMode`). This hook lets a test stand up a real local-OAuth
+ * system over a temporary `tokens.json` and drive `add`/`remove` end to end.
+ */
+export function _setAuthSystemForTesting(sys: AuthSystem | null): void {
+  authSystem = sys;
+  _driveByAlias.clear();
+  _calendarByAlias.clear();
+}
+
+/**
+ * Run the real `manage_accounts add` flow for testing.
+ *
+ * `openBrowser` defaults to false here (the tool handler passes true): a test
+ * must never have `AuthServer.start` launch a browser — it drives the OAuth
+ * callback with an HTTP request instead.
+ */
+export function _addAccountFlowForTesting(
+  alias: string,
+  openBrowser = false,
+): Promise<AddAccountResult> {
+  return addAccountFlow(alias, openBrowser);
 }
 
 /**
