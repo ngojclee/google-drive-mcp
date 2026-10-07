@@ -114,13 +114,19 @@ jobs:
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.lnc_rebuild == 'true'
         env:
           GITEA_PUSH_URL: https://louis:${{ secrets.REGISTRY_TOKEN }}@gitea.lengoc.me/automations/google-drive-mcp.git
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CYGNUS_URL: ${{ secrets.CYGNUS_GATEWAY_URL }}
+          CYGNUS_TOKEN: ${{ secrets.CYGNUS_GATEWAY_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
           tag="${{ steps.upstream.outputs.tag }}"
           version="${{ steps.upstream.outputs.version }}"
-          notify() { curl -fsS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d "chat_id=${TG_CHAT}" --data-urlencode "text=$1" >/dev/null || true; }
+          notify() {
+            curl -fsS -X POST "${CYGNUS_URL}/send" \
+              -H "Authorization: Bearer ${CYGNUS_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data-raw "{\"chat_id\":${TG_CHAT},\"text\":\"$1\"}" >/dev/null || true
+          }
 
           git clone --quiet "$GITEA_PUSH_URL" fork
           cd fork
