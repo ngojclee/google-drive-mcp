@@ -125,7 +125,7 @@ jobs:
             curl -fsS -X POST "${CYGNUS_URL}/send" \
               -H "Authorization: Bearer ${CYGNUS_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data-raw "{\"chat_id\":${TG_CHAT},\"text\":\"$1\"}" >/dev/null || true
+              --data-raw "{\"chat_id\":${TG_CHAT},\"message_thread_id\":1545,\"text\":\"$1\"}" >/dev/null || true
           }
 
           git clone --quiet "$GITEA_PUSH_URL" fork
