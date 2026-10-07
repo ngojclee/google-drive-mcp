@@ -23,6 +23,7 @@ env:
   REGISTRY: gitea.lengoc.me
   IMAGE: gitea.lengoc.me/automations/google-drive-mcp
   UPSTREAM: https://github.com/piotr-agier/google-drive-mcp.git
+  NODE_OPTIONS: --max-old-space-size=2048
 
 jobs:
   build:
