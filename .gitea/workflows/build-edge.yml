@@ -77,7 +77,7 @@ jobs:
 
       - name: Login to Gitea registry
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
-        run: echo "${{ secrets.GITEA_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ gitea.actor }}" --password-stdin
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u louis --password-stdin
 
       - name: Build and push edge image
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.force_edge == 'true'
