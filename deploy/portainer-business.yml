@@ -1,0 +1,81 @@
+name: google-drive-mcp
+
+services:
+  google-drive-mcp:
+    image: ${GOOGLE_MCP_IMAGE:-gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.gmail.20261016.2}
+    pull_policy: always
+    container_name: google-drive-mcp
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    command: [start, --transport, http, --host, 0.0.0.0, --port, "3110", --no-resources]
+    environment:
+      NODE_ENV: production
+      GOOGLE_DRIVE_OAUTH_CREDENTIALS: /config/gcp-oauth.keys.json
+      GOOGLE_DRIVE_MCP_TOKEN_PATH: /config/tokens.json
+      GOOGLE_DRIVE_MCP_SCOPES: ${GOOGLE_MCP_SCOPES:?Preserve current Google OAuth scopes}
+      MCP_HTTP_BEARER_TOKEN: ${MCP_HTTP_BEARER_TOKEN:?Preserve current upstream bearer}
+      MCP_HTTP_ALLOWED_HOSTS: 10.21.4.101,google-drive-mcp
+    ports:
+      - "10.21.4.101:3110:3110"
+    volumes:
+      - /home/Docker/google-drive-mcp/config:/config:rw
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 100
+    mem_limit: 512m
+    cpus: "1.0"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3110/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  google-workspace-connector:
+    image: ${GOOGLE_CONNECTOR_IMAGE:?Set tested immutable connector image or digest}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=256
+      GOOGLE_CONNECTOR_PAIRING_TOKEN: ${GOOGLE_CONNECTOR_PAIRING_TOKEN:?Hub-issued connector pairing bearer}
+      GOOGLE_CONNECTOR_DELEGATION_SECRET: ${GOOGLE_CONNECTOR_DELEGATION_SECRET:?Hub-issued delegation secret}
+      GOOGLE_CONNECTOR_UPSTREAM_TOKEN: ${MCP_HTTP_BEARER_TOKEN:?Same existing Google upstream bearer}
+      GOOGLE_CONNECTOR_ACCOUNT: ${GOOGLE_CONNECTOR_ACCOUNT:?Exact existing account alias, not email unless alias is email}
+      GOOGLE_CONNECTOR_UPSTREAM_URL: http://google-drive-mcp:3110/mcp
+      GOOGLE_CONNECTOR_TLS_CERT: /tls/server.crt
+      GOOGLE_CONNECTOR_TLS_KEY: /tls/server.key
+    ports:
+      - "10.21.4.101:3443:3443"
+    volumes:
+      - /home/Docker/google-drive-mcp/connector-tls:/tls:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: "1.0"
+    healthcheck:
+      test: [CMD, node, -e, "require('https').get('https://10.21.4.101:3443/health',{ca:require('fs').readFileSync('/tls/ca.crt')},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"

@@ -1,0 +1,542 @@
+{
+  "addComment": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addDataValidation": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addDimensionGroup": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addDocumentTab": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addGoogleSheetConditionalFormat": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addNamedRange": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addSheet": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "addSpreadsheetSheet": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "appendSpreadsheetRows": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "applyParagraphStyle": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "applyTextStyle": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "autoResizeColumns": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "autoResizeRows": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "batchUpdateGoogleSheetValues": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "bulkConvertFolderPdfs": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "convertPdfToGoogleDoc": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "copyFile": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createCalendarEvent": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createDocFromHTML": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createFolder": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createFootnote": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createGmailDraft": {
+    "required_scopes": [
+      "gmail:draft:create"
+    ]
+  },
+  "createGoogleDoc": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createGoogleSheet": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createGoogleSlides": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createGoogleSlidesShape": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createGoogleSlidesTextBox": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createParagraphBullets": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createShortcut": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "createTextFile": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "describeGoogleDocRange": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "duplicateSlide": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "editTableCell": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "exportSlideThumbnail": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "findAndReplaceInDoc": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleDocParagraph": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleDocText": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleSheetCells": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleSheetNumbers": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleSheetText": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleSlidesParagraph": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "formatGoogleSlidesText": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "getCalendarEvent": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getCalendarEvents": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getComment": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getDocumentInfo": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGmailMessage": {
+    "required_scopes": [
+      "gmail:read"
+    ]
+  },
+  "getGoogleDocContent": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleDocContentPaginated": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleDocImage": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleDocStyleSummary": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleSheetCells": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleSheetContent": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleSlidesContent": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getGoogleSlidesSpeakerNotes": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getRevisions": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getSlideElementInfo": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "getSpreadsheetInfo": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "hideSheetDimension": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "insertSmartChip": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "insertTable": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "insertText": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "listCalendars": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listComments": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listDimensionGroups": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listDocumentTabs": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listFolder": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listGmailDrafts": {
+    "required_scopes": [
+      "gmail:read"
+    ]
+  },
+  "listGoogleDocs": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listGoogleSheets": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listPermissions": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listSharedDrives": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "listSheets": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "mergeGoogleSheetCells": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "moveItem": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "moveSlideElement": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "protectRange": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "readGoogleDoc": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "readGoogleDocPaginated": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "readSmartChips": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "readTextFile": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "renameDocumentTab": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "renameItem": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "renameSheet": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "reorderSlides": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "replaceAllTextInSlides": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "replyToComment": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "search": {
+    "required_scopes": [
+      "workspace:read"
+    ]
+  },
+  "searchGmailMessages": {
+    "required_scopes": [
+      "gmail:read"
+    ]
+  },
+  "setColumnWidth": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setElementText": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setElementZOrder": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setGoogleSheetBorders": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setGoogleSlidesBackground": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setRowHeight": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "setSlideVisibility": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "showSheetDimension": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "styleDocTable": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "styleGoogleSlidesShape": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateCalendarEvent": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateDimensionGroup": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateGoogleDoc": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateGoogleSheet": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateGoogleSheetIfUnchanged": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateGoogleSlides": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateGoogleSlidesSpeakerNotes": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "updateTextFile": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  },
+  "uploadFile": {
+    "required_scopes": [
+      "workspace:write"
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+name: Build Google Workspace connector
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Immutable connector tag
+        required: true
+        default: 1.0.0-lnc.20261016.1
+        type: string
+concurrency:
+  group: google-workspace-connector-publish
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: docker-build
+    container:
+      image: node:22-bookworm
+      options: --memory=4g
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install docker CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz -C /tmp --strip-components=1 docker/docker
+          mv /tmp/docker /usr/local/bin/docker
+      - name: Source checks and tests
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm run lint
+          npm run test:build
+          MCP_TESTING=1 node --test --test-concurrency=2 ".tmp-test/test/**/*.test.js"
+          MCP_TESTING=1 node scripts/connector-catalog.js --check
+          node scripts/build-connector.js
+      - name: Registry login
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login gitea.lengoc.me -u louis --password-stdin
+      - name: Publish immutable connector only
+        env:
+          IMAGE_TAG: ${{ gitea.event.inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_TAG" =~ ^[0-9][A-Za-z0-9_.-]{0,127}$ ]] || exit 1
+          IMAGE=gitea.lengoc.me/automations/google-workspace-connector
+          if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then echo 'Immutable tag exists'; exit 1; fi
+          docker build -f Dockerfile.connector --label "org.opencontainers.image.revision=${{ gitea.sha }}" --label "org.opencontainers.image.version=$IMAGE_TAG" --label "org.opencontainers.image.source=${{ gitea.server_url }}/${{ gitea.repository }}" -t "$IMAGE:$IMAGE_TAG" .
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker manifest inspect "$IMAGE:$IMAGE_TAG"

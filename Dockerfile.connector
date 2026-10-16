@@ -1,0 +1,9 @@
+FROM node:22-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+COPY dist/connector.js ./dist/connector.js
+USER node
+EXPOSE 3443
+ENTRYPOINT ["node", "dist/connector.js"]
