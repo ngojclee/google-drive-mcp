@@ -28,6 +28,8 @@ const PRESENTATIONS = 'https://www.googleapis.com/auth/presentations';
 const CALENDAR = 'https://www.googleapis.com/auth/calendar';
 const CALENDAR_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
 const CALENDAR_READONLY = 'https://www.googleapis.com/auth/calendar.readonly';
+const GMAIL_READONLY = 'https://www.googleapis.com/auth/gmail.readonly';
+const GMAIL_COMPOSE = 'https://www.googleapis.com/auth/gmail.compose';
 
 const DRIVE_READ_SCOPES = [DRIVE_READONLY, DRIVE_FILE, DRIVE];
 const DRIVE_WRITE_SCOPES = [DRIVE_FILE, DRIVE];
@@ -42,6 +44,8 @@ const SLIDES_READ_SCOPES = [PRESENTATIONS, DRIVE_READONLY, DRIVE_FILE, DRIVE];
 const SLIDES_WRITE_SCOPES = [PRESENTATIONS, DRIVE_FILE, DRIVE];
 const CAL_READ_SCOPES = [CALENDAR_READONLY, CALENDAR, CALENDAR_EVENTS];
 const CAL_WRITE_SCOPES = [CALENDAR, CALENDAR_EVENTS];
+const GMAIL_READ_SCOPES = [GMAIL_READONLY];
+const GMAIL_DRAFT_READ_SCOPES = [GMAIL_READONLY, GMAIL_COMPOSE];
 
 // -- Helpers ----------------------------------------------------------------
 
@@ -194,6 +198,12 @@ export const TOOL_META: Record<string, ToolMeta> = {
   createCalendarEvent: write(CAL_WRITE_SCOPES),
   updateCalendarEvent: write(CAL_WRITE_SCOPES),
   deleteCalendarEvent: write(CAL_WRITE_SCOPES),
+
+  // ---- Gmail ----
+  searchGmailMessages: read(GMAIL_READ_SCOPES),
+  getGmailMessage: read(GMAIL_READ_SCOPES),
+  listGmailDrafts: read(GMAIL_DRAFT_READ_SCOPES),
+  createGmailDraft: write([GMAIL_COMPOSE]),
 
   // ---- Admin ----
   manage_accounts: admin,

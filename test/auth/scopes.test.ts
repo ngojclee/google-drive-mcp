@@ -78,6 +78,18 @@ test('resolveOAuthScopes maps aliases and dedupes', () => {
   });
 });
 
+test('resolveOAuthScopes accepts least-privilege Gmail scopes without adding them by default', () => {
+  withScopeEnv('drive.file,gmail.readonly,gmail.compose', () => {
+    assert.deepEqual(resolveOAuthScopes(), [
+      SCOPE_ALIASES['drive.file'],
+      SCOPE_ALIASES['gmail.readonly'],
+      SCOPE_ALIASES['gmail.compose'],
+    ]);
+  });
+  assert.ok(!DEFAULT_SCOPES.includes(SCOPE_ALIASES['gmail.readonly']));
+  assert.ok(!DEFAULT_SCOPES.includes(SCOPE_ALIASES['gmail.compose']));
+});
+
 test('resolveOAuthScopes returns DEFAULT_SCOPES when the env var is unset', () => {
   withScopeEnv(undefined, () => {
     assert.deepEqual(resolveOAuthScopes(), [...DEFAULT_SCOPES]);

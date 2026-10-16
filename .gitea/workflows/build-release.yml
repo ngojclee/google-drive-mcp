@@ -20,7 +20,7 @@ on:
     - cron: "17 */6 * * *"
 
 concurrency:
-  group: gitea-upstream-release
+  group: gitea-lnc-publish
   cancel-in-progress: false
 
 env:
@@ -146,7 +146,8 @@ jobs:
           lnc_tag="${version}-lnc.${n}"
 
           npm ci --ignore-scripts
-          node scripts/build.js
+          npm run lint
+          npm test
           revision="$(git rev-parse HEAD)"
           git push --quiet origin HEAD:master
           cd ..

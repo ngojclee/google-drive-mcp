@@ -139,14 +139,25 @@ test('AuthServer callback persists v2-only via onTokens (no flat v1 file, no bac
     assert.equal(await authServer.start(false), true);
     const port = authServer.getRunningPort();
     assert.ok(port, 'auth server should be listening');
+    const authUrl = authServer.getAuthorizeUrl();
+    assert.ok(authUrl);
+    const state = new URL(authUrl).searchParams.get('state');
+    assert.ok(state, 'authorize URL must include state');
 
-    const res = await fetch(`http://localhost:${port}/oauth2callback?code=x`);
+    const invalidState = await fetch(`http://127.0.0.1:${port}/oauth2callback?code=x&state=wrong`);
+    assert.equal(invalidState.status, 400);
+    assert.equal(authServer.authCompletedSuccessfully, false);
+
+    const res = await fetch(`http://127.0.0.1:${port}/oauth2callback?code=x&state=${encodeURIComponent(state)}`);
     assert.equal(res.status, 200);
     const body = await res.text();
     // Success page must not disclose the token file location.
     assert.ok(!body.includes(dir), 'success page must not contain the token path');
     assert.match(body, /close this browser window/i);
     assert.equal(authServer.authCompletedSuccessfully, true);
+
+    const replay = await fetch(`http://127.0.0.1:${port}/oauth2callback?code=x&state=${encodeURIComponent(state)}`);
+    assert.equal(replay.status, 400);
 
     const onDisk = JSON.parse(await fs.readFile(tokenPath, 'utf8'));
     assert.equal(onDisk.version, 2);
@@ -165,13 +176,22 @@ test('buildAuthSystem first-time bootstrap persists alias "default" end-to-end',
   const restoreGetToken = stubGetToken();
   try {
     const systemPromise = buildAuthSystem({ openBrowser: false });
+    let state: string | null = null;
 
     // Poll until the callback server is up, then complete the "consent".
     const deadline = Date.now() + 10_000;
     let completed = false;
     while (!completed && Date.now() < deadline) {
       try {
-        const res = await fetch('http://localhost:18640/oauth2callback?code=x');
+        const landing = await fetch('http://127.0.0.1:18640/');
+        const html = await landing.text();
+        const href = /href="([^"]+)"/.exec(html)?.[1]?.replace(/&amp;/g, '&');
+        if (href) state = new URL(href).searchParams.get('state');
+        if (!state) {
+          await new Promise((r) => setTimeout(r, 50));
+          continue;
+        }
+        const res = await fetch(`http://127.0.0.1:18640/oauth2callback?code=x&state=${encodeURIComponent(state)}`);
         completed = res.status === 200;
       } catch {
         await new Promise((r) => setTimeout(r, 50));
@@ -206,8 +226,12 @@ test('AuthServer failure path: onTokens throw renders failure page, persists not
     assert.equal(await authServer.start(false), true);
     const port = authServer.getRunningPort();
     assert.ok(port, 'auth server should be listening');
+    const authUrl = authServer.getAuthorizeUrl();
+    assert.ok(authUrl);
+    const state = new URL(authUrl).searchParams.get('state');
+    assert.ok(state);
 
-    const res = await fetch(`http://localhost:${port}/oauth2callback?code=x`);
+    const res = await fetch(`http://127.0.0.1:${port}/oauth2callback?code=x&state=${encodeURIComponent(state)}`);
     assert.equal(res.status, 500);
     assert.match(await res.text(), /Authentication Failed/);
     assert.equal(authServer.authCompletedSuccessfully, false);

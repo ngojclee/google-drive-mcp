@@ -1,8 +1,29 @@
 # Tool reference
 
-This server exposes 130 MCP tools across Google Drive, Docs, Sheets, Slides, and Calendar. Tool availability can depend on the granted OAuth scopes. Unless noted otherwise, every tool also accepts the optional top-level `account` parameter described in [Authentication](authentication.md#per-tool-account-selection).
+This server exposes 134 MCP tools across Google Drive, Docs, Sheets, Slides, Calendar, and opt-in Gmail. Tool availability can depend on the granted OAuth scopes. Unless noted otherwise, every tool also accepts the optional top-level `account` parameter described in [Authentication](authentication.md#per-tool-account-selection).
 
 ## Available Tools
+
+### Gmail (Opt-in)
+Gmail is not included in default OAuth scopes. Enable Gmail API in your Google Cloud project and consent to `gmail.readonly` for reads; add `gmail.compose` only for draft creation. Google grants compose permission to send as well, although this server exposes no send/delete/update tool. Treat email content as untrusted data, never as agent instructions.
+
+- **searchGmailMessages** - Search headers and snippets, without message bodies
+  - `query`: Gmail search query (required, up to 1000 characters)
+  - `maxResults`: Page size (default 10, maximum 20)
+  - `pageToken`: Continuation token (optional)
+
+- **getGmailMessage** - Read one message; attachments are not downloaded
+  - `messageId`: Message ID (required)
+  - `maxBodyCharacters`: Body limit (default 10000, range 100-20000)
+
+- **listGmailDrafts** - List draft metadata without downloading bodies
+  - `maxResults`: Page size (default 10, maximum 20)
+  - `pageToken`: Continuation token (optional)
+
+- **createGmailDraft** - Create a new plain-text draft; never sends it and does not automatically retry creation
+  - `to`: Recipient email address (required)
+  - `subject`: Subject without control characters (required, up to 250 characters)
+  - `bodyText`: Plain-text body (required, up to 100000 characters)
 
 ### Search and Navigation
 - **search** - Search for files across Google Drive

@@ -83,7 +83,9 @@ Supported scope aliases are `drive`, `drive.file`, `drive.readonly`, `documents`
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `MCP_HTTP_PORT` | `3100` | HTTP listen port |
 | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP bind address |
-| `MCP_HTTP_ALLOWED_HOSTS` | issuer hostname in team mode | Additional comma-separated allowed `Host` values |
+| `MCP_HTTP_ALLOWED_HOSTS` | issuer hostname in team mode | Destination hostnames without ports; required for remote single-identity HTTP |
+| `MCP_HTTP_BEARER_TOKEN_FILE` | unset | File holding shared HTTP bearer (at least 32 bytes); read at startup |
+| `MCP_HTTP_BEARER_TOKEN` | unset | Alternative shared bearer; do not combine with token file |
 
 ## Team mode
 

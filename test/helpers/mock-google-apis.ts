@@ -283,6 +283,57 @@ export function createCalendarMock() {
 }
 
 // ---------------------------------------------------------------------------
+// Gmail mock
+// ---------------------------------------------------------------------------
+export function createGmailMock() {
+  const tracker = new CallTracker();
+  const messages = {
+    list: stub(tracker, 'messages.list', {
+      resultSizeEstimate: 1,
+      messages: [{ id: 'message-1', threadId: 'thread-1' }],
+    }),
+    get: stub(tracker, 'messages.get', {
+      id: 'message-1',
+      threadId: 'thread-1',
+      snippet: 'Hello from Gmail',
+      payload: {
+        mimeType: 'text/plain',
+        headers: [
+          { name: 'From', value: 'sender@example.com' },
+          { name: 'To', value: 'recipient@example.com' },
+          { name: 'Subject', value: 'A Gmail message' },
+          { name: 'Date', value: 'Thu, 1 Jan 2026 00:00:00 +0000' },
+        ],
+        body: { data: Buffer.from('Hello body').toString('base64url') },
+      },
+      labelIds: ['INBOX'],
+    }),
+  };
+  const drafts = {
+    list: stub(tracker, 'drafts.list', { drafts: [{ id: 'draft-1' }] }),
+    get: stub(tracker, 'drafts.get', {
+      id: 'draft-1',
+      message: {
+        id: 'draft-message-1',
+        threadId: 'thread-1',
+        snippet: 'Draft snippet',
+        payload: {
+          headers: [
+            { name: 'To', value: 'recipient@example.com' },
+            { name: 'Subject', value: 'Draft subject' },
+          ],
+        },
+      },
+    }),
+    create: stub(tracker, 'drafts.create', {
+      id: 'draft-created',
+      message: { id: 'message-created', threadId: 'thread-created' },
+    }),
+  };
+  return { service: { users: { messages, drafts } }, tracker };
+}
+
+// ---------------------------------------------------------------------------
 // Bundle all mocks together
 // ---------------------------------------------------------------------------
 export interface AllMocks {
@@ -291,6 +342,7 @@ export interface AllMocks {
   sheets: ReturnType<typeof createSheetsMock>;
   slides: ReturnType<typeof createSlidesMock>;
   calendar: ReturnType<typeof createCalendarMock>;
+  gmail: ReturnType<typeof createGmailMock>;
   google: Record<string, (...args: any[]) => any>;
 }
 
@@ -300,6 +352,7 @@ export function createAllMocks(): AllMocks {
   const sheets = createSheetsMock();
   const slides = createSlidesMock();
   const calendar = createCalendarMock();
+  const gmail = createGmailMock();
 
   const google: Record<string, (...args: any[]) => any> = {
     drive: () => drive.service,
@@ -307,7 +360,8 @@ export function createAllMocks(): AllMocks {
     sheets: () => sheets.service,
     slides: () => slides.service,
     calendar: () => calendar.service,
+    gmail: () => gmail.service,
   };
 
-  return { drive, docs, sheets, slides, calendar, google };
+  return { drive, docs, sheets, slides, calendar, gmail, google };
 }

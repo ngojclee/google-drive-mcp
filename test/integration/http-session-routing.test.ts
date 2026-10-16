@@ -107,6 +107,7 @@ describe('HTTP per-session account routing', () => {
     (google as any).sheets = mocks.google.sheets;
     (google as any).slides = mocks.google.slides;
     (google as any).calendar = mocks.google.calendar;
+    (google as any).gmail = mocks.google.gmail;
 
     mod = await getServerModule();
     mod._setAuthClientForTesting({ request: async () => ({ data: 'mock' }) });

@@ -6,6 +6,7 @@ import * as docsTools from '../../src/tools/docs.js';
 import * as sheetsTools from '../../src/tools/sheets.js';
 import * as slidesTools from '../../src/tools/slides.js';
 import * as calendarTools from '../../src/tools/calendar.js';
+import * as gmailTools from '../../src/tools/gmail.js';
 import { ADMIN_TOOLS, TOOL_META } from '../../src/tools/toolMeta.js';
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,7 @@ const registeredToolNames: string[] = [
   sheetsTools,
   slidesTools,
   calendarTools,
+  gmailTools,
 ].flatMap((m) => m.toolDefinitions.map((d) => d.name));
 
 test('every registered tool has a TOOL_META entry', () => {
@@ -88,6 +90,22 @@ test('every acceptable scope is a full URL, not an alias', () => {
 
 const DRIVE = 'https://www.googleapis.com/auth/drive';
 const DRIVE_READONLY = 'https://www.googleapis.com/auth/drive.readonly';
+const GMAIL_READONLY = 'https://www.googleapis.com/auth/gmail.readonly';
+const GMAIL_COMPOSE = 'https://www.googleapis.com/auth/gmail.compose';
+
+test('Gmail read tools require gmail.readonly', () => {
+  for (const name of ['searchGmailMessages', 'getGmailMessage']) {
+    assert.deepEqual(TOOL_META[name].acceptableScopes, [GMAIL_READONLY]);
+    assert.equal(TOOL_META[name].opKind, 'read');
+  }
+});
+
+test('draft listing accepts read or compose while draft creation requires compose', () => {
+  assert.deepEqual(TOOL_META.listGmailDrafts.acceptableScopes, [GMAIL_READONLY, GMAIL_COMPOSE]);
+  assert.equal(TOOL_META.listGmailDrafts.opKind, 'read');
+  assert.deepEqual(TOOL_META.createGmailDraft.acceptableScopes, [GMAIL_COMPOSE]);
+  assert.equal(TOOL_META.createGmailDraft.opKind, 'write');
+});
 
 const PRODUCT_TOOLS: Array<{ read: string; write: string }> = [
   { read: 'readGoogleDoc', write: 'createGoogleDoc' },

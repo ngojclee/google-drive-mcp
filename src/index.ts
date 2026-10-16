@@ -13,7 +13,7 @@ import {
   ReadResourceRequestSchema,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
-import { randomUUID } from 'crypto';
+import { randomUUID, timingSafeEqual } from 'crypto';
 import type { Response } from 'express';
 import { google } from "googleapis";
 import type { drive_v3, calendar_v3 } from "googleapis";
@@ -55,6 +55,7 @@ import * as docsTools from './tools/docs.js';
 import * as sheetsTools from './tools/sheets.js';
 import * as slidesTools from './tools/slides.js';
 import * as calendarTools from './tools/calendar.js';
+import * as gmailTools from './tools/gmail.js';
 import { ADMIN_TOOLS, FALLBACK_META, TOOL_META } from './tools/toolMeta.js';
 
 const FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
@@ -266,9 +267,11 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
         // fresh userinfo lookup fails, so we never regress a known email/sub.
         let email = existing?.email ?? 'unknown';
         let sub = existing?.sub ?? `pending:${alias}:${Date.now()}`;
-        let pendingIdentity = existing?.pendingIdentity ?? true;
+        let pendingIdentity = existing ? !!existing.pendingIdentity : true;
+        let discoveredSub: string | undefined;
         try {
           const info = await fetchUserInfo(flowClient);
+          discoveredSub = info.sub;
           email = info.email;
           sub = info.sub;
           pendingIdentity = false;
@@ -278,6 +281,9 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
             error: (err as Error).message,
           });
         }
+        if (existing && !existing.pendingIdentity && discoveredSub && discoveredSub !== existing.sub) {
+          throw new Error(`Selected Google account differs from '${alias}'. Existing credentials were not replaced.`);
+        }
         const now = new Date().toISOString();
         const record: AccountRecord = {
           alias,
@@ -286,7 +292,9 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
           accessToken: tokens.access_token ?? '',
           // Google omits refresh_token on some re-consents; keep the prior one.
           refreshToken: tokens.refresh_token ?? existing?.refreshToken ?? '',
-          scope: tokens.scope ?? scopes.join(' '),
+          // A returned scope is authoritative. When Google omits it, retain the
+          // existing grant rather than assuming requested scopes were granted.
+          scope: tokens.scope ?? existing?.scope ?? scopes.join(' '),
           tokenType: 'Bearer',
           expiryDate: tokens.expiry_date ?? 0,
           addedAt: existing?.addedAt ?? now,
@@ -323,6 +331,11 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
   if (!authUrl) {
     throw new Error('Auth server started but could not generate an authorize URL.');
   }
+  const callbackPort = authServer.getRunningPort();
+  if (callbackPort === null) {
+    await authServer.stop();
+    throw new Error('Auth server started but did not report its callback port.');
+  }
 
   const cancel = async () => {
     await authServer.stop();
@@ -339,7 +352,7 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
       }
     });
 
-  return { authUrl, completion, cancel };
+  return { authUrl, callbackPort, completion, cancel };
 }
 
 async function removeAccountFlow(alias: string): Promise<void> {
@@ -468,7 +481,7 @@ async function checkFileExists(name: string, parentFolderId: string = 'root', dr
 // -----------------------------------------------------------------------------
 // DOMAIN MODULES
 // -----------------------------------------------------------------------------
-const domainModules = [driveTools, docsTools, sheetsTools, slidesTools, calendarTools];
+const domainModules = [driveTools, docsTools, sheetsTools, slidesTools, calendarTools, gmailTools];
 
 // -----------------------------------------------------------------------------
 // Per-tool `account` parameter plumbing
@@ -1056,6 +1069,7 @@ Team Mode (multi-user HTTP deployments):
   --issuer-url <url>         Public https URL this server is reachable at (required with --team)
 
 Options:
+  --no-browser              With auth: print consent URL for a loopback SSH tunnel
   --no-resources[=<bool>]    Disable the MCP resource protocol (gdrive:/// listing/reading);
                              tools stay available. Bare flag disables; --no-resources=false
                              re-enables (overrides a truthy GOOGLE_DRIVE_MCP_DISABLE_RESOURCES).
@@ -1092,6 +1106,8 @@ Environment Variables:
   MCP_TRANSPORT                         Transport mode: stdio or http (default: stdio)
   MCP_HTTP_PORT                         HTTP listen port (default: 3100)
   MCP_HTTP_HOST                         HTTP bind address (default: 127.0.0.1)
+  MCP_HTTP_BEARER_TOKEN_FILE            File holding shared HTTP bearer (preferred)
+  MCP_HTTP_BEARER_TOKEN                 Alternative shared bearer; do not combine with file
 
   Team Mode:
   MCP_TEAM_MODE                         Enable team mode (1/0, true/false; same as --team)
@@ -1106,7 +1122,7 @@ Environment Variables:
   MCP_TEAM_STORE_PATH                   Store file path (default: <config dir>/team-store.json)
   MCP_TRUST_PROXY                       Trusted reverse-proxy hop count, e.g. 1 on Cloud Run
                                         (default: unset — direct connections)
-  MCP_HTTP_ALLOWED_HOSTS                Extra Host-header allowlist entries besides the issuer host
+  MCP_HTTP_ALLOWED_HOSTS                Destination hostnames without ports; required for remote single-identity HTTP
 
   Service Account Mode:
   GOOGLE_APPLICATION_CREDENTIALS        Path to service account JSON key file
@@ -1124,7 +1140,7 @@ function showVersion(): void {
   console.log(`Google Drive MCP Server v${VERSION}`);
 }
 
-async function runAuthServer(alias?: string): Promise<void> {
+async function runAuthServer(alias?: string, noBrowser = false): Promise<void> {
   try {
     // Assemble the multi-account system WITHOUT the empty-store first-time flow, so
     // the CLI drives a single additive consent below. This never flat-overwrites a
@@ -1141,13 +1157,19 @@ async function runAuthServer(alias?: string): Promise<void> {
     }
 
     const target =
-      alias ?? sys.store.getDefault() ?? sys.store.list()[0]?.alias ?? 'default';
+      alias ?? sys.store.getDefault() ?? sys.store.list()[0]?.alias ?? (noBrowser ? 'primary' : 'default');
 
     // Fresh install bootstrapping a reserved alias (e.g. 'default'): addAccountFlow
     // can't create a reserved alias, so use the standard first-time flow, whose
     // onTokens callback persists the account as 'default' directly into the v2
     // store. Safe: the store is empty here, so there is nothing to overwrite.
     if (sys.store.list().length === 0 && RESERVED_ALIASES.has(target)) {
+      if (noBrowser) {
+        throw new Error(
+          'The token store is empty. Run the first-time "auth" flow in an environment with a browser, ' +
+            'or start the server once to complete initial authentication.',
+        );
+      }
       authSystem = await buildAuthSystem({ tokenRefresh: runtimeConfig });
       const created = requireAuthSystem().store.getDefault() ?? 'default';
       console.log(`Authentication successful. Account '${created}' is ready.`);
@@ -1156,10 +1178,17 @@ async function runAuthServer(alias?: string): Promise<void> {
 
     console.log(
       `${sys.store.get(target) ? 'Re-authenticating' : 'Authenticating'} account ` +
-        `'${target}'. Complete the consent in your browser...`,
+        `'${target}'. ${noBrowser ? 'Open the one-time URL below in your browser.' : 'Complete the consent in your browser...'}`,
     );
 
-    const { completion, cancel } = await addAccountFlow(target, true);
+    const { authUrl, callbackPort, completion, cancel } = await addAccountFlow(target, !noBrowser);
+    if (noBrowser) {
+      console.log(`\nGoogle OAuth URL (expires with this login session):\n${authUrl}\n`);
+      console.log(
+        `The callback listens only on 127.0.0.1:${callbackPort}. ` +
+          'Keep the SSH tunnel open until consent completes.',
+      );
+    }
     const timeoutMs = 5 * 60 * 1000;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -1198,6 +1227,7 @@ interface CliArgs {
   httpHost: string;
   team: boolean;
   issuerUrl?: string;
+  noBrowser: boolean;
 }
 
 function parseCliArgs(): CliArgs {
@@ -1209,6 +1239,7 @@ function parseCliArgs(): CliArgs {
   let httpHost: string | undefined;
   let team: boolean | undefined;
   let issuerUrl: string | undefined;
+  let noBrowser = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -1236,6 +1267,10 @@ function parseCliArgs(): CliArgs {
     }
     if (arg === '--issuer-url' && i + 1 < args.length) {
       issuerUrl = args[++i];
+      continue;
+    }
+    if (arg === '--no-browser') {
+      noBrowser = true;
       continue;
     }
 
@@ -1280,6 +1315,7 @@ function parseCliArgs(): CliArgs {
     httpHost: httpHost || process.env.MCP_HTTP_HOST || '127.0.0.1',
     team: resolvedTeam,
     issuerUrl,
+    noBrowser,
   };
 }
 
@@ -1288,7 +1324,7 @@ async function main() {
 
   switch (args.command) {
     case "auth":
-      await runAuthServer(args.authAlias);
+      await runAuthServer(args.authAlias, args.noBrowser);
       break;
     case "start":
     case undefined:
@@ -1357,17 +1393,59 @@ interface CreateHttpAppOptions {
   sessionIdleTimeoutMs?: number;
   /** Present = team mode: mount the OAuth 2.1 authorization-server surface. */
   teamAuth?: TeamRuntime;
+  /** Optional shared bearer for a single-identity HTTP deployment. */
+  bearerToken?: string;
+  /** Hostname allowlist for a single-identity HTTP deployment. */
+  allowedHosts?: string[];
 }
 
 function createHttpApp(host: string, options?: CreateHttpAppOptions) {
   const idleTimeoutMs = options?.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS;
   const teamAuth = options?.teamAuth;
+  const bearerTokenPath = process.env.MCP_HTTP_BEARER_TOKEN_FILE;
+  if ((options?.bearerToken ?? process.env.MCP_HTTP_BEARER_TOKEN) && bearerTokenPath) {
+    throw new Error('Configure only one of MCP_HTTP_BEARER_TOKEN and MCP_HTTP_BEARER_TOKEN_FILE.');
+  }
+  let bearerToken = options?.bearerToken ?? process.env.MCP_HTTP_BEARER_TOKEN;
+  if (!bearerToken && bearerTokenPath) {
+    try {
+      bearerToken = readFileSync(bearerTokenPath, 'utf8').trim();
+    } catch {
+      throw new Error(`Could not read MCP_HTTP_BEARER_TOKEN_FILE: ${bearerTokenPath}`);
+    }
+  }
+  const configuredHosts = options?.allowedHosts ?? (process.env.MCP_HTTP_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  const allowedHosts = [...new Set([...configuredHosts, 'localhost', '127.0.0.1', '[::1]'])];
+
+  if (!teamAuth && !isLoopbackHost(host)) {
+    if (!bearerToken || Buffer.byteLength(bearerToken, 'utf8') < 32) {
+      throw new Error(
+        'Binding single-identity HTTP to a non-loopback host requires MCP_HTTP_BEARER_TOKEN_FILE ' +
+          'or MCP_HTTP_BEARER_TOKEN with at least 32 bytes.',
+      );
+    }
+    if (configuredHosts.length === 0) {
+      throw new Error(
+        'Binding single-identity HTTP to a non-loopback host requires MCP_HTTP_ALLOWED_HOSTS ' +
+          'with the exact hostnames clients use.',
+      );
+    }
+  }
+
   // In team mode the SDK's automatic (localhost-only) Host validation is
   // replaced with an explicit allowlist derived from the issuer URL — for
   // non-localhost binds the SDK otherwise applies no Host validation at all.
   const app = createMcpExpressApp(
-    teamAuth ? { host, allowedHosts: teamAuth.config.allowedHosts } : { host },
+    teamAuth
+      ? { host, allowedHosts: teamAuth.config.allowedHosts }
+      : allowedHosts.length > 0
+        ? { host, allowedHosts }
+        : { host },
   );
+  app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
   if (teamAuth) {
     if (teamAuth.config.trustProxy !== undefined) {
       // Without this, every user behind a reverse proxy shares the proxy's IP
@@ -1402,7 +1480,25 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
           resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(teamAuth.config.issuerUrl),
         }),
       ]
-    : [];
+    : bearerToken
+      ? [(req: any, res: Response, next: () => void) => {
+          const header = req.headers.authorization;
+          const match = typeof header === 'string' ? /^Bearer (.+)$/i.exec(header) : null;
+          const provided = Buffer.from(match?.[1] ?? '', 'utf8');
+          const expected = Buffer.from(bearerToken!, 'utf8');
+          const valid = provided.length === expected.length && timingSafeEqual(provided, expected);
+          if (!valid) {
+            res.setHeader('WWW-Authenticate', 'Bearer');
+            res.status(401).json({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'Unauthorized' },
+              id: null,
+            });
+            return;
+          }
+          next();
+        }]
+      : [];
   const sessions = new Map<string, HttpSession>();
   const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -1759,6 +1855,8 @@ export function _setAuthClientForTesting(client: any) {
       'https://www.googleapis.com/auth/presentations',
       'https://www.googleapis.com/auth/calendar',
       'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.compose',
     ].join(' '),
     tokenType: 'Bearer',
     expiryDate: Date.now() + 60 * 60 * 1000,

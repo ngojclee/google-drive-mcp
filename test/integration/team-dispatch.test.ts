@@ -116,6 +116,7 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
     (google as any).sheets = mocks.google.sheets;
     (google as any).slides = mocks.google.slides;
     (google as any).calendar = mocks.google.calendar;
+    (google as any).gmail = mocks.google.gmail;
 
     idp = new FakeIdp();
     store = new InMemoryTeamStore();

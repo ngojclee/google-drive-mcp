@@ -190,10 +190,13 @@ describe('re-consent evicts cached clients (issue #168)', () => {
     driveAuths = [];
 
     // 2. Re-consent the same alias through the real flow.
-    const { completion } = await serverModule._addAccountFlowForTesting('work');
+    const { completion, callbackPort, authUrl } = await serverModule._addAccountFlowForTesting('work');
     // 127.0.0.1, not `localhost`: AuthServer binds the loopback IP explicitly so
     // the bind and the redirect URI agree on dual-stack hosts (see auth/server.ts).
-    const callback = await fetch(`http://127.0.0.1:${AUTH_PORT}/oauth2callback?code=x`);
+    const state = new URL(authUrl).searchParams.get('state');
+    assert.ok(state, 'reauth authorize URL must carry state');
+    assert.equal(callbackPort, AUTH_PORT);
+    const callback = await fetch(`http://127.0.0.1:${callbackPort}/oauth2callback?code=x&state=${encodeURIComponent(state)}`);
     assert.equal(callback.status, 200);
     const record = await completion;
 
@@ -222,5 +225,35 @@ describe('re-consent evicts cached clients (issue #168)', () => {
     const onDisk = JSON.parse(await fs.readFile(tokenPath, 'utf8'));
     assert.equal(onDisk.accounts.work.accessToken, NEW_ACCESS);
     assert.equal(onDisk.accounts.work.email, 'work@example.com');
+  });
+
+  it('retains existing scopes and refresh token when Google omits them', async () => {
+    const original = OAuth2Client.prototype.getToken;
+    const before = sys.store.get('work')!;
+    (OAuth2Client.prototype as any).getToken = async () => ({ tokens: { access_token: 'scope-omitted', expiry_date: Date.now() + HOUR_MS } });
+    try {
+      const flow = await serverModule._addAccountFlowForTesting('work');
+      const state = new URL(flow.authUrl).searchParams.get('state')!;
+      const res = await fetch(`http://127.0.0.1:${flow.callbackPort}/oauth2callback?code=x&state=${state}`);
+      assert.equal(res.status, 200);
+      const record = await flow.completion;
+      assert.equal(record.scope, before.scope);
+      assert.equal(record.refreshToken, before.refreshToken);
+    } finally { OAuth2Client.prototype.getToken = original; }
+  });
+
+  it('rejects re-consent to another known Google identity without replacing credentials', async () => {
+    const original = OAuth2Client.prototype.request;
+    const before = sys.store.get('work')!;
+    (OAuth2Client.prototype as any).request = async () => ({ data: { sub: 'different-user', email: 'other@example.com' } });
+    try {
+      const flow = await serverModule._addAccountFlowForTesting('work');
+      const rejected = assert.rejects(flow.completion, /differs/);
+      const state = new URL(flow.authUrl).searchParams.get('state')!;
+      const res = await fetch(`http://127.0.0.1:${flow.callbackPort}/oauth2callback?code=x&state=${state}`);
+      assert.equal(res.status, 500);
+      await rejected;
+      assert.deepEqual(sys.store.get('work'), before);
+    } finally { OAuth2Client.prototype.request = original; }
   });
 });

@@ -12,9 +12,14 @@ on:
         required: true
         default: 2.5.0-lnc.1
         type: string
+      publish_latest:
+        description: "Move lnc-latest only after server secrets and clients are ready"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
-  group: gitea-fork-hotfix-${{ gitea.event.inputs.image_tag }}
+  group: gitea-lnc-publish
   cancel-in-progress: false
 
 env:
@@ -36,22 +41,35 @@ jobs:
             | tar xz -C /tmp --strip-components=1 docker/docker
           mv /tmp/docker /usr/local/bin/docker
 
-      - name: Install deps and build dist
+      - name: Install deps, lint, test and build
         run: |
           set -euo pipefail
           npm ci --ignore-scripts
-          node scripts/build.js
+          npm run lint
+          npm test
 
       - name: Login to Gitea registry
         run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u louis --password-stdin
 
       - name: Build and push immutable image
+        env:
+          IMAGE_TAG: ${{ gitea.event.inputs.image_tag }}
+          PUBLISH_LATEST: ${{ gitea.event.inputs.publish_latest }}
         run: |
           set -euo pipefail
+          [[ "$IMAGE_TAG" =~ ^[0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "Invalid immutable tag" >&2; exit 1; }
+          if docker manifest inspect "${{ env.IMAGE }}:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Immutable tag already exists" >&2
+            exit 1
+          fi
           docker build \
             --label "org.opencontainers.image.source=${{ gitea.server_url }}/${{ gitea.repository }}" \
             --label "org.opencontainers.image.revision=${{ gitea.sha }}" \
-            --label "org.opencontainers.image.version=${{ gitea.event.inputs.image_tag }}" \
-            -t "${{ env.IMAGE }}:${{ gitea.event.inputs.image_tag }}" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            -t "${{ env.IMAGE }}:$IMAGE_TAG" \
             .
-          docker push "${{ env.IMAGE }}:${{ gitea.event.inputs.image_tag }}"
+          docker push "${{ env.IMAGE }}:$IMAGE_TAG"
+          if [ "$PUBLISH_LATEST" = true ]; then
+            docker tag "${{ env.IMAGE }}:$IMAGE_TAG" "${{ env.IMAGE }}:lnc-latest"
+            docker push "${{ env.IMAGE }}:lnc-latest"
+          fi

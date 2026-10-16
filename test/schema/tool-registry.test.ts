@@ -3,10 +3,11 @@ import { describe, it, before, after } from 'node:test';
 import { setupTestServer, type TestContext } from '../helpers/setup-server.js';
 import { TOOL_META } from '../../src/tools/toolMeta.js';
 
-const EXPECTED_TOOL_COUNT = 130;
+const EXPECTED_TOOL_COUNT = 134;
 
 const EXPECTED_TOOLS = [
   'manage_accounts',
+  'searchGmailMessages', 'getGmailMessage', 'listGmailDrafts', 'createGmailDraft',
   'search', 'createTextFile', 'updateTextFile', 'readTextFile', 'createFolder', 'listFolder', 'listSharedDrives',
   'deleteItem', 'renameItem', 'moveItem',
   'createGoogleDoc', 'createDocFromHTML', 'updateGoogleDoc', 'insertText', 'deleteRange',

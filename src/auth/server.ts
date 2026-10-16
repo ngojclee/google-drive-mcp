@@ -1,5 +1,6 @@
 import express from 'express';
 import { Credentials, OAuth2Client } from 'google-auth-library';
+import { randomBytes, timingSafeEqual } from 'crypto';
 import http from 'http';
 import open from 'open';
 import { loadCredentials } from './client.js';
@@ -44,6 +45,8 @@ export class AuthServer {
   private readonly onTokens: (tokens: Credentials) => Promise<void>;
   private readonly promptMode: PromptMode;
   private readonly scopes: readonly string[];
+  private flowState: string | null = null;
+  private callbackAccepted = false;
   public readonly portRange: { start: number; end: number };
   public authCompletedSuccessfully = false; // Flag for standalone script
 
@@ -70,6 +73,8 @@ export class AuthServer {
       access_type: 'offline',
       scope: [...this.scopes],
       prompt: this.promptMode,
+      include_granted_scopes: true,
+      ...(this.flowState ? { state: this.flowState } : {}),
     });
   }
 
@@ -85,11 +90,35 @@ export class AuthServer {
     });
 
     this.app.get('/oauth2callback', async (req, res) => {
+      const returnedState = typeof req.query.state === 'string' ? req.query.state : '';
+      const expectedState = this.flowState ?? '';
+      const returnedBytes = Buffer.from(returnedState, 'utf8');
+      const expectedBytes = Buffer.from(expectedState, 'utf8');
+      if (
+        !expectedState ||
+        returnedBytes.length !== expectedBytes.length ||
+        !timingSafeEqual(returnedBytes, expectedBytes)
+      ) {
+        res.status(400).send('Invalid OAuth state. Restart the authentication flow.');
+        return;
+      }
+      const oauthError = typeof req.query.error === 'string' ? req.query.error : undefined;
+      if (oauthError) {
+        this.callbackAccepted = true;
+        this.authCompletedSuccessfully = false;
+        res.status(400).send('Google authorization was not completed. Restart the authentication flow.');
+        return;
+      }
       const code = req.query.code as string;
       if (!code) {
         res.status(400).send('Authorization code missing');
         return;
       }
+      if (this.callbackAccepted) {
+        res.status(400).send('This OAuth callback has already been used.');
+        return;
+      }
+      this.callbackAccepted = true;
       // IMPORTANT: Use the flowOAuth2Client to exchange the code
       if (!this.flowOAuth2Client) {
         res.status(500).send('Authentication flow not properly initiated.');
@@ -179,6 +208,8 @@ export class AuthServer {
         client_secret || undefined,
         `http://127.0.0.1:${port}/oauth2callback`
       );
+      this.flowState = randomBytes(32).toString('hex');
+      this.callbackAccepted = false;
     } catch (error) {
         // Could not load credentials, cannot proceed with auth flow.
         // describeErrorForLog: a JSON.parse SyntaxError echoes fragments of the

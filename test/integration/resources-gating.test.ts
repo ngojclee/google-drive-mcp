@@ -44,6 +44,7 @@ describe('resources capability gating (server wiring)', () => {
     (google as any).sheets = mocks.google.sheets;
     (google as any).slides = mocks.google.slides;
     (google as any).calendar = mocks.google.calendar;
+    (google as any).gmail = mocks.google.gmail;
 
     serverModule = await import('../../src/index.js');
     serverModule._setAuthClientForTesting({

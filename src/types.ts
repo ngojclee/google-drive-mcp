@@ -64,6 +64,8 @@ export interface ToolContext {
 export interface AddAccountResult {
   /** URL the user visits to complete consent. Shown in tool output. */
   authUrl: string;
+  /** Loopback port serving the OAuth callback; useful for a local SSH tunnel. */
+  callbackPort: number;
   /** Resolves when the OAuth callback lands and the record is persisted. */
   completion: Promise<AccountRecord>;
   /** Stops the embedded auth server (idempotent). */

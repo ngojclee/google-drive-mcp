@@ -8,6 +8,7 @@ import { toolDefinitions as docsTools } from '../src/tools/docs.js';
 import { toolDefinitions as driveTools } from '../src/tools/drive.js';
 import { toolDefinitions as sheetsTools } from '../src/tools/sheets.js';
 import { toolDefinitions as slidesTools } from '../src/tools/slides.js';
+import { toolDefinitions as gmailTools } from '../src/tools/gmail.js';
 
 const repositoryRoot = process.cwd();
 
@@ -152,7 +153,7 @@ describe('Documentation reference', () => {
   // direction that produces a caller-facing bug -- a documented name the
   // schema doesn't have -- not the reverse (schema parameters the docs omit).
   it('never claims a parameter that is not in the tool\'s schema', () => {
-    const allTools = [...docsTools, ...sheetsTools, ...slidesTools, ...driveTools, ...calendarTools];
+    const allTools = [...docsTools, ...sheetsTools, ...slidesTools, ...driveTools, ...calendarTools, ...gmailTools];
     const schemaByName = new Map(
       allTools.map((tool) => [
         tool.name,
@@ -248,7 +249,7 @@ describe('Documentation reference', () => {
     // confirms it is real, which is the check this test exists to force.
     const NOT_TOOL_NAMES = new Set([
       // JSON Schema
-      'anyOf', 'maxItems',
+      'anyOf', 'maxItems', 'maxLength',
       // Google API methods and request types
       'batchUpdate', 'updateCells', 'updatePageElementsZOrder', 'tableStartLocation',
       // Google API field names
@@ -281,7 +282,7 @@ describe('Documentation reference', () => {
       return into;
     }
 
-    const allTools = [...docsTools, ...sheetsTools, ...slidesTools, ...driveTools, ...calendarTools];
+    const allTools = [...docsTools, ...sheetsTools, ...slidesTools, ...driveTools, ...calendarTools, ...gmailTools];
     const registered = new Set(Object.keys(TOOL_META));
     const failures: string[] = [];
 

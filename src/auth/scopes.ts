@@ -11,11 +11,15 @@ export const SCOPE_ALIASES: Record<string, string> = {
   presentations: 'https://www.googleapis.com/auth/presentations',
   calendar: 'https://www.googleapis.com/auth/calendar',
   'calendar.events': 'https://www.googleapis.com/auth/calendar.events',
+  'gmail.readonly': 'https://www.googleapis.com/auth/gmail.readonly',
+  'gmail.compose': 'https://www.googleapis.com/auth/gmail.compose',
 };
 
 export const SCOPE_PRESETS: Record<string, string[]> = {
   readonly: ['drive.readonly'],
   'content-editor': ['drive.file', 'documents', 'spreadsheets', 'presentations'],
+  'gmail-readonly': ['gmail.readonly'],
+  'gmail-drafts': ['gmail.readonly', 'gmail.compose'],
   full: ['drive', 'documents', 'spreadsheets', 'presentations', 'calendar', 'calendar.events'],
 };
 

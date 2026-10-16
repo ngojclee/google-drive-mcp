@@ -32,6 +32,7 @@ async function setupMocks() {
   (google as any).sheets = mocks.google.sheets;
   (google as any).slides = mocks.google.slides;
   (google as any).calendar = mocks.google.calendar;
+  (google as any).gmail = mocks.google.gmail;
   const mod = await getServerModule();
   mod._setAuthClientForTesting({ request: async () => ({ data: 'mock' }) });
   return mod;

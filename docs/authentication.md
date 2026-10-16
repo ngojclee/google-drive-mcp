@@ -37,6 +37,8 @@ Notes:
 - Values can be full scope URLs or short aliases:
   `drive`, `drive.file`, `drive.readonly`, `documents`, `spreadsheets`, `presentations`, `calendar`, `calendar.events`.
 - Changing scopes usually requires re-authentication.
+- Gmail is opt-in: enable Gmail API and add `gmail.readonly`; add `gmail.compose` only for drafts. Compose is capable of sending at the Google API level even though this server exposes no send tool.
+- Headless consent supports `auth --no-browser` with a loopback SSH tunnel. See the repository's `deploy/README.md` for Docker/Portainer steps. Keep OAuth token files on the server, not agent machines.
 
 ### Auth Server Port Configuration
 
