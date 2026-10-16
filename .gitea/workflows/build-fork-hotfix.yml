@@ -25,11 +25,14 @@ concurrency:
 env:
   REGISTRY: gitea.lengoc.me
   IMAGE: gitea.lengoc.me/automations/google-drive-mcp
-  NODE_OPTIONS: --max-old-space-size=2048
+  NODE_OPTIONS: --max-old-space-size=3072
 
 jobs:
   build:
     runs-on: docker-build
+    container:
+      image: node:22-bookworm
+      options: --memory=4g
     steps:
       - name: Check out fork
         uses: actions/checkout@v4
@@ -46,7 +49,8 @@ jobs:
           set -euo pipefail
           npm ci --ignore-scripts
           npm run lint
-          npm test
+          npm run test:build
+          MCP_TESTING=1 node --test --test-concurrency=2 ".tmp-test/test/**/*.test.js"
 
       - name: Login to Gitea registry
         run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u louis --password-stdin
