@@ -90,6 +90,13 @@ test('resolveOAuthScopes accepts least-privilege Gmail scopes without adding the
   assert.ok(!DEFAULT_SCOPES.includes(SCOPE_ALIASES['gmail.compose']));
 });
 
+test('Gmail settings alias and full URL resolve identically without expanding defaults', () => {
+  withScopeEnv('gmail.settings.basic,https://www.googleapis.com/auth/gmail.settings.basic', () => {
+    assert.deepEqual(resolveOAuthScopes(), ['https://www.googleapis.com/auth/gmail.settings.basic']);
+  });
+  assert.ok(!DEFAULT_SCOPES.includes(SCOPE_ALIASES['gmail.settings.basic']));
+});
+
 test('resolveOAuthScopes returns DEFAULT_SCOPES when the env var is unset', () => {
   withScopeEnv(undefined, () => {
     assert.deepEqual(resolveOAuthScopes(), [...DEFAULT_SCOPES]);

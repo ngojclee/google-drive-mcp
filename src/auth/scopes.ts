@@ -13,6 +13,7 @@ export const SCOPE_ALIASES: Record<string, string> = {
   'calendar.events': 'https://www.googleapis.com/auth/calendar.events',
   'gmail.readonly': 'https://www.googleapis.com/auth/gmail.readonly',
   'gmail.compose': 'https://www.googleapis.com/auth/gmail.compose',
+  'gmail.settings.basic': 'https://www.googleapis.com/auth/gmail.settings.basic',
 };
 
 export const SCOPE_PRESETS: Record<string, string[]> = {
