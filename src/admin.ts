@@ -7,6 +7,7 @@ import type { AddAccountResult } from './types.js';
 import { SCOPE_ALIASES, USERINFO_SCOPES } from './auth/scopes.js';
 import { ALIAS_PATTERN } from './auth/types.js';
 import { adminHtml } from './adminHtml.js';
+import { AdminKey } from './adminKey.js';
 
 interface Dependencies {
   getSystem: () => Promise<AuthSystem>;
@@ -24,7 +25,14 @@ export function validDesktopCredentials(value: unknown): boolean {
 
 export function mountAdmin(app: Express, deps: Dependencies): void {
   const keyFile = process.env.MCP_ADMIN_KEY_FILE;
-  if (!keyFile) return; // Opt-in; MCP credentials never authorize management.
+  const bootstrap = process.env.MCP_ADMIN_BOOTSTRAP_KEY;
+  const storePath = process.env.MCP_ADMIN_KEY_STORE;
+  if (!keyFile && !bootstrap && !storePath) return;
+  if (keyFile && (bootstrap || storePath)) throw new Error('Choose legacy admin file OR runtime key store');
+  const managed = keyFile ? undefined : new AdminKey(storePath || '/config/admin-key.json', bootstrap || '');
+  const upstreamKey = async () => process.env.MCP_HTTP_BEARER_TOKEN_FILE
+    ? (await readFile(process.env.MCP_HTTP_BEARER_TOKEN_FILE, 'utf8')).trim()
+    : process.env.MCP_HTTP_BEARER_TOKEN;
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; until: number }>();
   let pending: { state: string; alias: string; callbackPort?: number } | undefined;
@@ -61,15 +69,14 @@ export function mountAdmin(app: Express, deps: Dependencies): void {
     }
     row.count++; attempts.set(ip, row);
     try {
-      const expected = Buffer.from((await readFile(keyFile, 'utf8')).trim());
-      const mcpToken = process.env.MCP_HTTP_BEARER_TOKEN_FILE
-        ? (await readFile(process.env.MCP_HTTP_BEARER_TOKEN_FILE, 'utf8')).trim()
-        : process.env.MCP_HTTP_BEARER_TOKEN;
-      if (mcpToken && expected.toString() === mcpToken) {
+      const mcpToken = await upstreamKey();
+      const suppliedKey = typeof req.body?.key === 'string' ? req.body.key : '';
+      const expected = managed ? undefined : Buffer.from((await readFile(keyFile!, 'utf8')).trim());
+      if (mcpToken && (managed ? await managed.verify(mcpToken) : expected!.toString() === mcpToken)) {
         res.status(503).json({ error: 'separate_admin_key_required' }); return;
       }
-      const supplied = Buffer.from(typeof req.body?.key === 'string' ? req.body.key : '');
-      if (expected.length < 32 || supplied.length !== expected.length || !timingSafeEqual(expected, supplied)) {
+      const supplied = Buffer.from(suppliedKey);
+      if (!(managed ? await managed.verify(suppliedKey) : expected!.length >= 32 && supplied.length === expected!.length && timingSafeEqual(expected!, supplied))) {
         res.status(401).json({ error: 'invalid_admin_key' }); return;
       }
       const id = randomBytes(32).toString('hex');
@@ -91,6 +98,23 @@ export function mountAdmin(app: Express, deps: Dependencies): void {
     sessions.delete(res.locals.sessionId);
     res.clearCookie('workspace_admin', { path: '/admin' }).json({ ok: true });
   });
+  router.post('/management/rotate', async (req, res) => {
+    if (!managed) { res.status(409).json({ error: 'file_managed_key' }); return; }
+    const { currentKey, replacementKey } = req.body ?? {};
+    if (typeof currentKey !== 'string' || typeof replacementKey !== 'string' || replacementKey.length < 32 || replacementKey.length > 256 || replacementKey === currentKey) {
+      res.status(400).json({ error: 'replacement_requires_32_to_256_characters' }); return;
+    }
+    const attemptKey = 'rotation';
+    const row = attempts.get(attemptKey);
+    if (row && row.until > Date.now() && row.count >= 10) { res.status(429).json({ error: 'rotation_rate_limited' }); return; }
+    attempts.set(attemptKey, { count: (row && row.until > Date.now() ? row.count : 0) + 1, until: row?.until && row.until > Date.now() ? row.until : Date.now() + 300000 });
+    try {
+      if (replacementKey === await upstreamKey()) { res.status(400).json({ error: 'separate_admin_key_required' }); return; }
+      await managed.rotate(currentKey, replacementKey);
+      sessions.clear();
+      res.clearCookie('workspace_admin', { path: '/admin' }).json({ ok: true });
+    } catch { res.status(403).json({ error: 'rotation_failed_check_current_key_and_storage' }); }
+  });
   router.get('/status', async (_req, res) => {
     try {
       const sys = await deps.getSystem();
@@ -103,7 +127,7 @@ export function mountAdmin(app: Express, deps: Dependencies): void {
       }));
       res.json({ access: {
         api: { configured: !!(process.env.MCP_HTTP_BEARER_TOKEN || process.env.MCP_HTTP_BEARER_TOKEN_FILE), source: 'environment', endpoint: '/mcp' },
-        management: { configured: true, source: 'file', path: keyFile },
+        management: managed ? await managed.inventory() : { configured: true, source: 'file', path: keyFile },
       }, settings: { resourcesDisabled: process.env.GOOGLE_DRIVE_MCP_DISABLE_RESOURCES === '1' || process.argv.includes('--no-resources'),
         allowedHosts: process.env.MCP_HTTP_ALLOWED_HOSTS || '', callbackHost: '127.0.0.1' },
       accounts: sys.store.list().map(a => ({ alias: a.alias, email: a.email,

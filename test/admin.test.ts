@@ -64,3 +64,33 @@ test('admin denies MCP bearer, rejects cross-origin login, authenticates cookie 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('runtime rotation signs out sessions and rejects old bootstrap after restart', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'workspace-rotate-'));
+  const names = ['MCP_ADMIN_KEY_FILE','MCP_ADMIN_BOOTSTRAP_KEY','MCP_ADMIN_KEY_STORE'];
+  const old = names.map(n=>process.env[n]);
+  delete process.env.MCP_ADMIN_KEY_FILE;
+  process.env.MCP_ADMIN_BOOTSTRAP_KEY = 'bootstrap-'.repeat(6);
+  process.env.MCP_ADMIN_KEY_STORE = join(dir,'key.json');
+  const app = express();
+  mountAdmin(app,{getSystem:async()=>{throw new Error('unused');},startConsent:async()=>{throw new Error('unused');}});
+  const server=app.listen(0,'127.0.0.1');
+  await new Promise<void>(r=>server.once('listening',r));
+  const url=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
+  const post=(path:string, body:unknown,cookie='')=>fetch(url+'/admin/'+path,{method:'POST',headers:{Origin:url,'X-Admin-Request':'1','Content-Type':'application/json',Cookie:cookie},body:JSON.stringify(body)});
+  try {
+    const login=await post('login',{key:process.env.MCP_ADMIN_BOOTSTRAP_KEY});
+    assert.equal(login.status,200);
+    const cookie=login.headers.get('set-cookie')!.split(';')[0];
+    const replacementKey='replacement-'.repeat(6);
+    assert.equal((await post('management/rotate',{currentKey:'wrong',replacementKey},cookie)).status,403);
+    assert.equal((await post('management/rotate',{currentKey:process.env.MCP_ADMIN_BOOTSTRAP_KEY,replacementKey},cookie)).status,200);
+    assert.equal((await fetch(url+'/admin/status',{headers:{Cookie:cookie}})).status,401);
+    assert.equal((await post('login',{key:process.env.MCP_ADMIN_BOOTSTRAP_KEY})).status,401);
+    assert.equal((await post('login',{key:replacementKey})).status,200);
+  } finally {
+    server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));
+    names.forEach((n,i)=>{if(old[i]===undefined)delete process.env[n];else process.env[n]=old[i];});
+    await rm(dir,{recursive:true,force:true});
+  }
+});

@@ -1,5 +1,32 @@
 # Workspace Admin UI
 
+## Bootstrap And Runtime Management Key (next image)
+
+Choose ONE mode. Legacy `GOOGLE_MCP_ADMIN_KEY_FILE` remains supported but is
+read-only and cannot rotate in UI. For bootstrap mode REMOVE that env value:
+
+```ini
+GOOGLE_MCP_ADMIN_KEY_FILE=
+GOOGLE_MCP_ADMIN_BOOTSTRAP_KEY=<unique 32-256 character initial management key>
+GOOGLE_MCP_ADMIN_KEY_STORE=/config/admin-key.json
+```
+
+Bootstrap is consumed on first login only if the store is absent. Runtime
+record contains random salt and scrypt hash, never plaintext. Existing runtime
+record wins even if bootstrap env changes. UI API Access shows Runtime Managed,
+creation time and Bootstrap Ignored. Rotate requires current key and replacement;
+success signs out ALL admin sessions. MCP bearer/pairing/OAuth remain untouched.
+Keep bootstrap separate from Google and connector secrets. Back up store with
+mode 600. Missing bootstrap with absent store or corrupt/unreadable store fails
+closed. One replica only; no shared-store multi-process rotation supported.
+
+Recovery is explicit operator action: stop Google service, securely back up the
+existing admin-key.json, rename ONLY that file, set a new bootstrap, restart,
+login and rotate. Never delete OAuth tokens.json or Google credentials. Do not
+automatically delete a corrupt key store. A missing store can bootstrap again,
+so protect its directory; removing bootstrap env after initialization reduces
+that recovery exposure while keeping `GOOGLE_MCP_ADMIN_KEY_STORE` configured.
+
 ## Published Evidence (2026-10-17)
 
 - Source: `cf89581324e7f7e2c676735b798944f10b248e9b` on master.
@@ -23,7 +50,8 @@ HttpOnly/SameSite cookie, same-origin mutations, CSP nonce and login rate limit.
 No secret values returned in inventory. OAuth uploads back up existing file.
 
 This is a single-owner control panel over existing Google storage, NOT a full
-blueprint credential vault. API Access and runtime settings are READ ONLY.
+blueprint credential vault. MCP API access and runtime settings are READ ONLY;
+runtime management keys support rotation in the next image described above.
 Pairing, agent keys and grants stay in Business; no misleading key create/copy/
 revoke controls. Existing mode-600 OAuth store is preserved, not migrated to an
 encrypted vault. No multi-tenant roles or hash-chain durable audit in this version.
