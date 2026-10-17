@@ -1,5 +1,15 @@
 # Workspace Admin UI
 
+## Host Data Directory
+
+Portainer host-root variable: `DATA_DIR=/home/Docker` (default). Compose mounts
+`${DATA_DIR}/google-drive-mcp/config` at `/config` and
+`${DATA_DIR}/google-drive-mcp/connector-tls` at `/tls`. This preserves current
+paths; no data migration or image rebuild is needed. Do NOT set DATA_DIR to
+`/home/Docker/google-drive-mcp` or it duplicates the app folder. Changing host
+root requires an explicit backup/migration of BOTH folders before redeploy;
+otherwise credentials, runtime key store and TLS files will appear missing.
+
 ## Bootstrap And Runtime Management Key
 
 Published image: `gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261017.2`.

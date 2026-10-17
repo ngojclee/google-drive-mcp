@@ -24,7 +24,7 @@ services:
       - "10.21.4.101:3110:3110"
       - "127.0.0.1:3300-3304:3300-3304"
     volumes:
-      - /home/Docker/google-drive-mcp/config:/config:rw
+      - ${DATA_DIR:-/home/Docker}/google-drive-mcp/config:/config:rw
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
