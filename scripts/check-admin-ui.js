@@ -8,12 +8,18 @@ try {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   let session=false;
-  await page.route('**/admin/status',route=>session?route.continue():route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'admin_login_required'})}));
+  let releaseSessionCheck;
+  const initialSessionCheck=new Promise(resolve=>{releaseSessionCheck=resolve});
+  await page.route('**/admin/status',async route=>{await initialSessionCheck;return session?route.continue():route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'admin_login_required'})})});
   await page.route('**/admin/login',async route=>{
     if(route.request().postDataJSON().key==='preview-valid-key') {session=true;await route.continue()}
     else await route.fulfill({status:401,json:{error:'admin_login_required'}});
   });
-  await page.goto('http://127.0.0.1:17456/admin/');
+  await page.goto('http://127.0.0.1:17456/admin/',{waitUntil:'domcontentloaded'});
+  assert.ok(await page.locator('.app-sidebar').isHidden(),'No shell while session check pending');
+  assert.ok(await page.locator('#signIn').isDisabled());
+  releaseSessionCheck();
+  await page.waitForFunction(()=>document.getElementById('loginMessage').textContent==='');
   await page.locator('#key').waitFor({state:'visible'});
   for(const [width,height] of [[1440,1000],[390,844],[390,360]]){
     await page.setViewportSize({width,height});
@@ -66,6 +72,16 @@ try {
   await page.locator('#login').waitFor({state:'visible'});
   assert.ok(await page.locator('#logout').isHidden());
   assert.ok(await page.locator('#nav').isHidden());
+  assert.equal(await page.locator('#accounts').textContent(),'');
+  await page.screenshot({path:'.tmp-test/admin-login-dark-desktop.png'});
+  await page.unroute('**/admin/status');
+  session=true;
+  await page.locator('#key').fill('preview-valid-key');
+  await page.locator('#signIn').click();
+  await page.locator('#workspace').waitFor({state:'visible'});
+  await page.locator('#logout').click();
+  await page.locator('#login').waitFor({state:'visible'});
+  assert.ok(await page.locator('.app-sidebar').isHidden());
   assert.deepEqual(errors,[]);
   console.log('Admin UI: 4 tabs, icon, desktop/mobile, themes, rotation cancel, error and session-expiry checks passed');
 } finally { await browser.close(); }
