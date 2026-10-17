@@ -7,7 +7,28 @@ try {
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
+  let session=false;
+  await page.route('**/admin/status',route=>session?route.continue():route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'admin_login_required'})}));
+  await page.route('**/admin/login',async route=>{
+    if(route.request().postDataJSON().key==='preview-valid-key') {session=true;await route.continue()}
+    else await route.fulfill({status:401,json:{error:'admin_login_required'}});
+  });
   await page.goto('http://127.0.0.1:17456/admin/');
+  await page.locator('#key').waitFor({state:'visible'});
+  for(const [width,height] of [[1440,1000],[390,844],[390,360]]){
+    await page.setViewportSize({width,height});
+    assert.ok(await page.locator('.app-sidebar').isHidden());
+    const box=await page.locator('#login').boundingBox();
+    assert.ok(Math.abs(box.x+box.width/2-width/2)<2,'Login centered horizontally');
+    if(height>500)assert.ok(Math.abs(box.y+box.height/2-height/2)<2,'Login centered vertically');
+    await page.screenshot({path:`.tmp-test/admin-login-${width}-${height}.png`});
+  }
+  await page.locator('#key').fill('invalid');
+  await page.locator('#signIn').click();
+  await page.waitForFunction(()=>document.getElementById('loginMessage').textContent==='admin_login_required');
+  assert.equal(await page.locator('#key').inputValue(),'');
+  await page.locator('#key').fill('preview-valid-key');
+  await page.locator('#signIn').click();
   await page.locator('#workspace').waitFor({ state: 'visible' });
   assert.ok(await page.locator('.app-brand img').evaluate(img=>img.complete && img.naturalWidth>0), 'Brand icon must render');
   await page.evaluate(()=>{document.documentElement.dataset.theme='light'});
@@ -17,6 +38,8 @@ try {
       await page.locator(`nav a[href="#${tab}"]`).click();
       await page.locator(`[data-page="${tab}"]`).waitFor({state:'visible'});
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth), `${tab} overflows ${width}`);
+      const themeBox=await page.locator('#theme').boundingBox(),logoutBox=await page.locator('#logout').boundingBox();
+      assert.ok(themeBox.y+themeBox.height<=logoutBox.y,'Theme above Sign out');
       await page.screenshot({path:`.tmp-test/admin-${tab}-${width}.png`,fullPage:true});
     }
   }
