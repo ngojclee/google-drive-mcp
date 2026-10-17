@@ -1,5 +1,7 @@
 # Google Drive MCP Server
 
+<p><img src="docs/icon.svg" alt="Google Drive MCP icon" width="72"></p>
+
 [![MCP Toplist](https://mcptoplist.com/badge/io.github.piotr-agier%2Fgoogle-drive-mcp.svg)](https://mcptoplist.com/server/io.github.piotr-agier%2Fgoogle-drive-mcp)
 
 Connect an MCP client to Google Drive, Docs, Sheets, Slides, and Calendar through one self-hosted server. Search and organize files, create and edit Workspace content, manage sharing, and automate multi-step workflows while keeping control of the Google identity and credentials used for every call.

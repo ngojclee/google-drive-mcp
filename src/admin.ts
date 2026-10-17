@@ -7,6 +7,7 @@ import type { AddAccountResult } from './types.js';
 import { SCOPE_ALIASES, USERINFO_SCOPES } from './auth/scopes.js';
 import { ALIAS_PATTERN } from './auth/types.js';
 import { adminHtml } from './adminHtml.js';
+import { ADMIN_ICON_SVG } from './adminIcon.js';
 import { AdminKey } from './adminKey.js';
 
 interface Dependencies {
@@ -46,8 +47,12 @@ export function mountAdmin(app: Express, deps: Dependencies): void {
   });
   router.get('/', (_req, res) => {
     const nonce = randomBytes(18).toString('base64');
-    res.set('Content-Security-Policy', `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`);
+    res.set('Content-Security-Policy', `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`);
     res.type('html').send(adminHtml.split('__NONCE__').join(nonce));
+  });
+  router.get('/favicon.svg', (_req, res) => {
+    res.set({ 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400, immutable' });
+    res.send(ADMIN_ICON_SVG);
   });
   // Custom header plus same-origin check prevents cross-site mutations on LAN HTTP.
   router.use((req, res, next) => {
