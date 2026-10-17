@@ -1,5 +1,8 @@
 # Shared Workspace MCP deployment
 
+For exact Gmail consent steps and optional management UI setup, read
+[GMAIL-ADMIN.md](GMAIL-ADMIN.md).
+
 Use the existing Gitea repository in Portainer, branch `master`, compose path
 `deploy/portainer.yml`, stack name `google-drive-mcp`. Update the existing stack;
 do not deploy a second stack with the same container name or port.

@@ -14,6 +14,8 @@ export type PromptMode =
   | 'consent select_account';
 
 export interface AuthServerOptions {
+  /** Container UI consent: publish this callback only on the host loopback. */
+  bindHost?: '127.0.0.1' | '0.0.0.0';
   /**
    * Receives the tokens from the OAuth callback. AuthServer never persists
    * tokens itself — the caller owns persistence into `AccountStore`
@@ -47,6 +49,7 @@ export class AuthServer {
   private readonly scopes: readonly string[];
   private flowState: string | null = null;
   private callbackAccepted = false;
+  private readonly bindHost: string;
   public readonly portRange: { start: number; end: number };
   public authCompletedSuccessfully = false; // Flag for standalone script
 
@@ -55,6 +58,7 @@ export class AuthServer {
     this.onTokens = opts.onTokens;
     this.promptMode = opts.promptMode ?? 'consent';
     this.scopes = opts.scopes ?? resolveOAuthScopes();
+    this.bindHost = opts.bindHost ?? '127.0.0.1';
     this.app = express();
     const raw = process.env.GOOGLE_DRIVE_MCP_AUTH_PORT;
     const portStart = raw ? Number(raw) : 3000;
@@ -252,11 +256,12 @@ export class AuthServer {
           // Create a temporary server instance to test the port.
           // Bind to the loopback interface explicitly: the OAuth redirect URI
           // is hard-coded to `http://127.0.0.1:<port>/oauth2callback`, so we
-          // never need to accept connections from other interfaces, and doing
-          // so would expose the short-lived auth server to the LAN. The IP is
+          // normally never accepts connections from other interfaces. The UI
+          // flow opts into container ingress with host-loopback-only publishing.
+          // The IP is
           // used (not `localhost`) so the bind and the redirect URI resolve to
           // the same address on dual-stack hosts.
-          const testServer = this.app.listen(port, '127.0.0.1', () => {
+          const testServer = this.app.listen(port, this.bindHost, () => {
             this.server = testServer; // Assign to class property *only* if successful
             console.error(`Authentication server listening on http://127.0.0.1:${port}`);
             resolve();

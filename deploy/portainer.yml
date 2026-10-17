@@ -16,8 +16,11 @@ services:
       GOOGLE_DRIVE_MCP_SCOPES: ${GOOGLE_MCP_SCOPES:-drive.file,documents,spreadsheets,presentations,gmail.readonly}
       MCP_HTTP_BEARER_TOKEN_FILE: /config/mcp-http-bearer-token
       MCP_HTTP_ALLOWED_HOSTS: ${GOOGLE_MCP_ALLOWED_HOSTS:-10.21.4.101}
+      MCP_ADMIN_KEY_FILE: ${GOOGLE_MCP_ADMIN_KEY_FILE:-}
+      GOOGLE_DRIVE_MCP_AUTH_PORT: "3300"
     ports:
       - "10.21.4.101:3110:3110"
+      - "127.0.0.1:3300-3304:3300-3304"
     volumes:
       - /home/Docker/google-drive-mcp/config:/config:rw
     read_only: true

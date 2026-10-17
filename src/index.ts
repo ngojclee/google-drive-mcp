@@ -49,6 +49,7 @@ import { GOOGLE_CALLBACK_PATH, isLoopbackHost, loadTeamConfig } from './auth/tea
 import { createTeamRuntime, type TeamRuntime } from './auth/team/runtime.js';
 import { coversScopes } from './auth/accountResolver.js';
 import { describeErrorForLog } from './auth/utils.js';
+import { mountAdmin } from './admin.js';
 
 import * as driveTools from './tools/drive.js';
 import * as docsTools from './tools/docs.js';
@@ -122,7 +123,7 @@ const toolLimiter = new ToolConcurrencyLimiter(
 // AUTH / ACCOUNT ACCESS
 // -----------------------------------------------------------------------------
 
-async function ensureAuthSystem(): Promise<AuthSystem> {
+async function ensureAuthSystem(interactiveIfEmpty = true): Promise<AuthSystem> {
   if (authSystem) return authSystem;
 
   if (authSystemPromise) {
@@ -132,7 +133,7 @@ async function ensureAuthSystem(): Promise<AuthSystem> {
   }
 
   log('Initializing authentication');
-  authSystemPromise = buildAuthSystem({ tokenRefresh: runtimeConfig });
+  authSystemPromise = buildAuthSystem({ tokenRefresh: runtimeConfig, interactiveIfEmpty });
   try {
     authSystem = await authSystemPromise;
     log('Authentication complete');
@@ -234,7 +235,7 @@ function validateNewAlias(alias: string): void {
   }
 }
 
-async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAccountResult> {
+async function addAccountFlow(alias: string, openBrowser = true, requestedScopes?: readonly string[]): Promise<AddAccountResult> {
   requireLocalOAuthMode('add');
   const sys = requireAuthSystem();
   const existing = sys.store.get(alias);
@@ -248,7 +249,7 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
 
   // Fresh OAuth2Client for this flow — will receive tokens on callback.
   const flowClient = await initializeOAuth2Client();
-  const scopes = resolveAddAccountScopes();
+  const scopes = requestedScopes ? [...requestedScopes] : resolveAddAccountScopes();
 
   let resolveCompletion!: (rec: AccountRecord) => void;
   let rejectCompletion!: (err: Error) => void;
@@ -258,6 +259,7 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
   });
 
   const authServer = new AuthServer(flowClient, {
+    bindHost: requestedScopes ? '0.0.0.0' : '127.0.0.1',
     promptMode: 'consent select_account',
     scopes,
     onTokens: async (tokens) => {
@@ -276,6 +278,7 @@ async function addAccountFlow(alias: string, openBrowser = true): Promise<AddAcc
           sub = info.sub;
           pendingIdentity = false;
         } catch (err) {
+          if (requestedScopes) throw new Error('Could not verify Google account identity. Existing account was not changed.');
           log('Userinfo lookup failed; proceeding with existing/pending identity', {
             alias,
             error: (err as Error).message,
@@ -1446,6 +1449,12 @@ function createHttpApp(host: string, options?: CreateHttpAppOptions) {
         : { host },
   );
   app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
+  if (!teamAuth) {
+    mountAdmin(app, {
+      getSystem: () => ensureAuthSystem(false),
+      startConsent: (alias, scopes) => addAccountFlow(alias, false, scopes),
+    });
+  }
   if (teamAuth) {
     if (teamAuth.config.trustProxy !== undefined) {
       // Without this, every user behind a reverse proxy shares the proxy's IP

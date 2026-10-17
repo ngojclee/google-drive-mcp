@@ -1,0 +1,9 @@
+import express from 'express';
+import { adminHtml } from '../.tmp-test/src/adminHtml.js';
+const app = express();
+app.use(express.json());
+app.get('/admin/', (_req,res)=>res.type('html').send(adminHtml.split('__NONCE__').join('local-preview')));
+app.post('/admin/login', (_req,res)=>res.json({ok:true}));
+app.post('/admin/logout', (_req,res)=>res.json({ok:true}));
+app.get('/admin/status', (_req,res)=>res.json({accounts:[{alias:'default',email:'demo@example.com',scopes:['https://www.googleapis.com/auth/gmail.readonly'],isDefault:true,hasRefreshToken:true}],files:[{kind:'oauth',path:'/config/gcp-oauth.keys.json',present:true,bytes:475}],consent:null,access:{api:{configured:true,endpoint:'/mcp'},management:{path:'/config/admin-key'}},settings:{resourcesDisabled:true,allowedHosts:'10.21.4.101,google-drive-mcp',callbackHost:'127.0.0.1'}}));
+app.listen(17456,'127.0.0.1',()=>console.log('Synthetic preview: http://127.0.0.1:17456/admin/'));
