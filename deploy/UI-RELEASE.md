@@ -1,6 +1,11 @@
 # Workspace Admin UI
 
-## Bootstrap And Runtime Management Key (next image)
+## Bootstrap And Runtime Management Key
+
+Published image: `gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261017.2`.
+Source `841aad2`; CI run 336 passed 1182 tests, zero failures/skips.
+Digest: `sha256:eedafac0a28bf459fecea0d2d9ac57354be60de9b63445ef8632f4b3e85eac9c`.
+No production deploy or live rotation performed.
 
 Choose ONE mode. Legacy `GOOGLE_MCP_ADMIN_KEY_FILE` remains supported but is
 read-only and cannot rotate in UI. For bootstrap mode REMOVE that env value:
