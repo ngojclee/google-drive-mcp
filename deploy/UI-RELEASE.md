@@ -1,5 +1,16 @@
 # Workspace Admin UI
 
+## Published Evidence (2026-10-17)
+
+- Source: `cf89581324e7f7e2c676735b798944f10b248e9b` on master.
+- CI: https://gitea.lengoc.me/automations/google-drive-mcp/actions/runs/335
+- Clean CI: 1180 passed, zero failures, zero skips.
+- Image: `gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261017.1`
+- Digest: `sha256:f1c1bee60300bcfd23357d78d46c64c7897df587ebddc89a1dd5f03a3960068f`
+- Local Edge screenshot checks: all four tabs at 1440x1000 and 390x844,
+  no document horizontal overflow, no page errors, theme toggle passed.
+- Not deployed by this release; live UI login/consent remains unverified.
+
 Owner deploys; no production settings, OAuth grants or pairing changed by this release.
 UI uses existing Google MCP process and port: `http://10.21.4.101:3110/admin/`.
 
