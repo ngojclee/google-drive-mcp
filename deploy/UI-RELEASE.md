@@ -1,5 +1,25 @@
 # Workspace Admin UI
 
+## Login Layout Release (2026-10-17)
+
+- Image: `gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261017.4`.
+- Digest: `sha256:5ec7431e5630177b52a2021cfe768ae1fa5a7eccf0741c655586a7712d99abb9`.
+- Image source: `59e88f8248836dd0ead66d6edb54e3107ad08e1f`.
+- CI run 338: https://gitea.lengoc.me/automations/google-drive-mcp/actions/runs/338
+  passed 1182 tests, no failures or skips; local lint/build and 3 auth tests pass.
+- Standalone centered login, no pre-auth shell flash; Theme and Sign out stacked
+  in sidebar footer. Failed submission clears key; session expiry hides inventory
+  and clears sensitive forms. No backend/OAuth/key storage behavior changed.
+- Extended browser check in follow-up test-only commit `7aa59d8` passes locally:
+  pending session, failed/successful login, desktop/mobile/short-screen centering,
+  footer order, themes, rotation cancel, API error, session expiry and Sign out.
+- Owner: update GOOGLE_MCP_IMAGE to the tag above in the existing Portainer
+  Repository stack, then pull/redeploy. Keep every other env value and mount.
+  Rollback uses full image prefix with tag `2.12.0-lnc.ui.20261017.3`.
+- Preview login accepts a nonempty dummy key and shows synthetic data only.
+  Never enter real management secrets in the local preview.
+- No production deployment or live authentication acceptance performed.
+
 ## UI Refresh (2026-10-17)
 
 - Source: `fc1cf113db0b48bb243e6b66f030552750649e83` on master.
