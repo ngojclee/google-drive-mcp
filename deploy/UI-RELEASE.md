@@ -1,5 +1,25 @@
 # Workspace Admin UI
 
+## UI Refresh (2026-10-17)
+
+- Source: `fc1cf113db0b48bb243e6b66f030552750649e83` on master.
+- Published image: `gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261017.3`.
+- Digest: `sha256:7f17f7ceedc17066398c7ac64ff532ac012997838f48b94c01bf56ae09721595`.
+- CI: https://gitea.lengoc.me/automations/google-drive-mcp/actions/runs/337
+  passed 1182 tests, no failures/skips. Local Windows: 1181 passed, one skipped.
+- Blueprint lean sidebar shell, shared paper-sketch icon/favicon, mobile navigation,
+  light/dark themes, management rotation confirmation with cleared password fields.
+- Local Edge checks: four tabs at 1440x1000 and 390x844; icon renders, no document
+  overflow/page errors; theme, rotation cancel, API failure and session expiry pass.
+- Owner redeploys the existing Repository stack using `refs/heads/master` and
+  `deploy/portainer-business.yml`. If GOOGLE_MCP_IMAGE is already set in Portainer,
+  change it to the image above; it overrides the compose default. Keep all keys,
+  scopes, DATA_DIR and connector settings unchanged. Open `/admin/` after redeploy.
+- Rollback: set GOOGLE_MCP_IMAGE back to `2.12.0-lnc.ui.20261017.2` using the same
+  registry/repository prefix; redeploy with the same persistent config mount.
+- No production deployment, live login, OAuth consent or key rotation performed.
+  Preview is synthetic and does not prove production access.
+
 ## Host Data Directory
 
 Portainer host-root variable: `DATA_DIR=/home/Docker` (default). Compose mounts
