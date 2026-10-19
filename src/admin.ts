@@ -198,5 +198,6 @@ export function mountAdmin(app: Express, deps: Dependencies): void {
   router.use((_err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(400).json({ error: 'invalid_admin_request' });
   });
+  app.get('/login.html', (_req, res) => res.redirect(303, '/admin'));
   app.use('/admin', router);
 }
