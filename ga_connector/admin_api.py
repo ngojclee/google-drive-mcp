@@ -243,13 +243,18 @@ def _list_mp_secrets(c: Any, a: dict[str, Any]) -> dict[str, Any]:
 
 
 def _create_mp_secret(c: Any, a: dict[str, Any]) -> dict[str, Any]:
-    nickname = str(a.get("nickname", "")).strip() or "connector"
+    display_name = (
+        str(a.get("display_name") or a.get("nickname") or "").strip()
+        or "connector"
+    )
     return {
         "measurement_protocol_secret": _dump(
             c.create_measurement_protocol_secret(
                 request={
                     "parent": _mp_parent(a),
-                    "measurement_protocol_secret": {"nickname": nickname},
+                    "measurement_protocol_secret": {
+                        "display_name": display_name
+                    },
                 }
             )
         )
@@ -476,7 +481,14 @@ ADMIN_TOOLS: dict[str, AdminToolSpec] = {
     "create_measurement_protocol_secret": AdminToolSpec(
         WRITE,
         "Create a Measurement Protocol API secret for server-side tracking.",
-        _props(["data_stream"], {**_STREAM, "nickname": {"type": "string"}}),
+        _props(
+            ["data_stream"],
+            {
+                **_STREAM,
+                "display_name": {"type": "string"},
+                "nickname": {"type": "string"},
+            },
+        ),
         _create_mp_secret,
     ),
     "delete_measurement_protocol_secret": AdminToolSpec(
