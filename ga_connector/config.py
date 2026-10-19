@@ -68,6 +68,7 @@ class GaConnectorConfig:
     allowed_hosts: tuple[str, ...] # hostnames the service answers for
     google_credentials_file: str   # mounted service-account JSON
     google_project_id: str
+    management_token: str          # protects the local operator dashboard
 
     @classmethod
     def from_env(cls) -> "GaConnectorConfig":
@@ -86,4 +87,5 @@ class GaConnectorConfig:
             allowed_hosts=_csv("GA_ALLOWED_HOSTS"),
             google_credentials_file=creds,
             google_project_id=os.getenv("GOOGLE_PROJECT_ID", "").strip(),
+            management_token=_required_secret("MANAGEMENT_TOKEN"),
         )

@@ -6,7 +6,7 @@ import unittest
 from starlette.testclient import TestClient
 
 from ga_connector.config import GaConnectorConfig
-from ga_connector.server import create_app
+from ga_connector.server import _dashboard_signature, create_app
 from ga_connector.upstream import UpstreamGa
 from ga_connector.delegation import canonical_delegation
 
@@ -50,6 +50,7 @@ def config():
         allowed_hosts=("testserver",),
         google_credentials_file="/run/secrets/does-not-matter-in-this-test.json",
         google_project_id="",
+        management_token="d" * 40,
     )
 
 
@@ -62,6 +63,24 @@ class HttpBoundaryTests(unittest.TestCase):
             self.assertEqual(health.json()["service"], "ga-connector")
             denied = client.post("/mcp", json={})
             self.assertEqual(denied.status_code, 401)
+
+    def test_dashboard_requires_management_login(self):
+        app = create_app(config(), UpstreamGa(FakeCoordinator()))
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/admin").url.path, "/admin/login")
+            login = client.post(
+                "/admin/login",
+                data={"token": "d" * 40},
+                follow_redirects=False,
+            )
+            self.assertEqual(login.status_code, 303)
+            self.assertEqual(client.get("/api/admin/status").status_code, 401)
+            allowed = client.get(
+                "/api/admin/status",
+                cookies={"ga_connector_admin": _dashboard_signature("d" * 40)},
+            )
+            self.assertEqual(allowed.status_code, 200)
+            self.assertEqual(allowed.json()["tool_count"], 9)
 
     def test_scoped_tool_discovery_works(self):
         app = create_app(config(), UpstreamGa(FakeCoordinator()))

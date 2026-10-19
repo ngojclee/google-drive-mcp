@@ -20,6 +20,15 @@ Business MCP Hub publishes those as `google_analytics__<tool>`. The connector
 does not expose account configuration, OAuth, arbitrary Google API calls, or
 any mutation operations.
 
+## Operator Dashboard
+
+`https://<final-hostname>/admin` is a deliberately small status and setup
+dashboard. Log in using the independent `MANAGEMENT_TOKEN` configured in
+Portainer. It confirms only whether the service-account file is mounted and
+whether the closed GA tool catalog loaded; it never displays, edits, or exports
+pairing values, Google keys, or GA property data. Runtime configuration remains
+declarative in Portainer so every change is auditable.
+
 ## Security Contract
 
 - `/mcp` accepts only the connector bearer issued by a **disabled** managed
@@ -58,15 +67,16 @@ application-default login` files into an image.
 This repository intentionally supplies a template only; it does not deploy or
 restart anything.
 
-1. Publish a signed/tagged CI image to GHCR, then use the immutable image tag
-   or digest in `deploy/stack.yml`.
-2. Copy `.env.example` to the root-owned host file
-   `/home/Docker/google-analytics-connector/env/google-analytics-connector.env`
-   (`0600`). Fill only the pairing values revealed once by Business MCP Hub
-   plus the final HTTPS hostname; no value belongs in Git or Portainer UI text.
+1. Deploy in Portainer **Repository** mode from this canonical Gitea
+   repository. It builds source with `stack.yml`; no registry image is needed.
+2. In the Portainer Stack environment panel, enter the values from
+   `.env.example` — pairing values revealed once by Business MCP Hub,
+   `MANAGEMENT_TOKEN`, final HTTPS hostname, and optional project id. The
+   compose file explicitly passes each variable to the container.
 3. Create an NPM/reverse-proxy host for the final hostname, upstream
-   `google-analytics-connector:3050`, with a certificate whose SAN includes
-   the hostname. Do not expose port 3050 publicly.
+   `http://10.21.4.101:3444`, with a certificate whose SAN includes the
+   hostname. `GA_HOST_PORT` defaults to `3444`; restrict it to LAN/proxy
+   access and do not add WAN/firewall exposure.
 4. Deploy the stack **without adding any Hub route yet**. Verify
    `GET /health` through the internal network and exact HTTPS hostname.
 5. In Business MCP Hub `/admin`, create a **disabled** connector:

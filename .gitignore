@@ -9,3 +9,4 @@ secrets/
 # Packaging artifacts
 build/
 dist/
+output/
