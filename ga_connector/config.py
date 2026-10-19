@@ -72,11 +72,10 @@ class GaConnectorConfig:
 
     @classmethod
     def from_env(cls) -> "GaConnectorConfig":
+        # The file itself is optional at boot: the service starts in a
+        # degraded state so the operator dashboard can upload it. Tool calls
+        # are rejected until the file exists.
         creds = _required_value("GOOGLE_APPLICATION_CREDENTIALS")
-        if not os.path.isfile(creds):
-            raise RuntimeError(
-                f"GOOGLE_APPLICATION_CREDENTIALS points to a missing file: {creds}"
-            )
         return cls(
             mcp_bearer_token=_required_secret("GA_MCP_BEARER_TOKEN"),
             hub_delegation_secret=_required_secret("GA_HUB_DELEGATION_SECRET"),

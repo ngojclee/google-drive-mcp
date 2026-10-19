@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
+import json
 import os
 from typing import Any
 
@@ -24,9 +25,15 @@ from ga_connector.delegation import (
     require_scope,
     verify_delegation_headers,
 )
-from ga_connector.upstream import TOOL_SCOPES, UnknownToolError, UpstreamGa
+from ga_connector.upstream import (
+    TOOL_SCOPES,
+    UnknownToolError,
+    UpstreamError,
+    UpstreamGa,
+)
 
 _DASHBOARD_COOKIE = "ga_connector_admin"
+_MAX_CREDENTIAL_BYTES = 1 * 1024 * 1024
 
 
 def _dashboard_signature(token: str) -> str:
@@ -42,6 +49,37 @@ def _dashboard_authorized(request: Request, config: GaConnectorConfig) -> bool:
     )
 
 
+def _credentials_meta(path: str) -> dict[str, Any]:
+    """Non-secret metadata about the mounted service-account key."""
+    meta: dict[str, Any] = {"present": False, "client_email": "", "project_id": ""}
+    if not os.path.isfile(path):
+        return meta
+    meta["present"] = True
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        meta["client_email"] = str(data.get("client_email", ""))
+        meta["project_id"] = str(data.get("project_id", ""))
+    except (OSError, ValueError):
+        meta["parse_error"] = True
+    return meta
+
+
+def _validate_service_account(payload: bytes) -> dict[str, Any]:
+    """Parse an uploaded key; raises ValueError on anything invalid."""
+    if not payload or len(payload) > _MAX_CREDENTIAL_BYTES:
+        raise ValueError("empty or oversized payload")
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("JSON object expected")
+    if data.get("type") != "service_account":
+        raise ValueError('expected a service_account key (type="service_account")')
+    for field in ("client_email", "private_key", "project_id"):
+        if not isinstance(data.get(field), str) or not data[field].strip():
+            raise ValueError(f"missing field: {field}")
+    return {"client_email": data["client_email"], "project_id": data["project_id"]}
+
+
 _DASHBOARD_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Google Analytics Connector</title>
@@ -49,9 +87,19 @@ _DASHBOARD_HTML = """<!doctype html>
 </head><body><main class="shell"><h1>Google Analytics Connector</h1>
 <p class="muted">Read-only operator status. Runtime secrets stay in Portainer; this page cannot display or modify them.</p>
 <div class="card" id="status">Loading connector status...</div>
-<h2>Google access</h2><ol><li>Create a dedicated Google Cloud service account.</li><li>Enable GA Data API + GA Admin API.</li><li>Add its email as Viewer/Analyst in GA4 Property access management.</li><li>Mount the JSON key read-only, then redeploy from Portainer.</li></ol>
+<h2>Service-account key</h2>
+<p class="muted">Upload the JSON key downloaded from Google Cloud. It is validated, stored on the host bind mount, and never echoed back — only the client email and project id are shown.</p>
+<input type="file" id="keyfile" accept="application/json,.json"><button id="upload" disabled>Upload key</button><span class="muted" id="upmsg"></span>
+<h2>Google access</h2><ol><li>Create a dedicated Google Cloud service account.</li><li>Enable GA Data API + GA Admin API.</li><li>Add its email as Viewer/Analyst in GA4 Property access management.</li><li>Upload the JSON key above.</li></ol>
 <p><a href="/health">Public health check</a> · <a href="/admin/logout">Sign out</a></p>
-</main><script>fetch('/api/admin/status').then(r=>r.json()).then(s=>{document.querySelector('#status').innerHTML='<b>Connector:</b> '+(s.ok?'ready':'not ready')+'<br><b>Credentials file mounted:</b> '+s.credentials_file_mounted+'<br><b>Upstream tool catalog:</b> '+s.tool_count+' read-only GA4 tools';}).catch(()=>location='/admin/login')</script></body></html>"""
+</main><script>
+const st=document.querySelector('#status'),fi=document.querySelector('#keyfile'),up=document.querySelector('#upload'),msg=document.querySelector('#upmsg');
+function render(s){st.innerHTML='<b>Connector:</b> '+(s.ok?'ready':'not ready')+'<br><b>Credentials:</b> '+(s.credentials.present?'installed':'<span style="color:#a33">missing — upload below</span>')+(s.credentials.client_email?'<br><b>Client email:</b> <code>'+s.credentials.client_email+'</code><br><b>Project:</b> <code>'+s.credentials.project_id+'</code>':'')+(s.credentials.parse_error?'<br><b>Warning:</b> file present but not valid JSON':'')+'<br><b>Upstream tool catalog:</b> '+s.tool_count+' read-only GA4 tools';}
+function load(){fetch('/api/admin/status').then(r=>r.json()).then(render).catch(()=>location='/admin/login');}
+fi.onchange=()=>{up.disabled=!fi.files.length;msg.textContent='';};
+up.onclick=()=>{const f=fi.files[0];if(!f)return;f.text().then(t=>fetch('/api/admin/credentials',{method:'POST',body:t})).then(async r=>{const j=await r.json().catch(()=>({error:'upload failed'}));if(r.ok){msg.textContent=' installed for '+j.client_email;load();}else{msg.textContent=' rejected: '+(j.error||r.status);}}).catch(e=>msg.textContent=' upload error');};
+load();
+</script></body></html>"""
 
 _LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connector login</title><style>body{background:#f2f5f2;font:16px Georgia,serif;color:#18352a}.box{max-width:360px;margin:20vh auto;background:#fffdf7;padding:32px;border-top:6px solid #cf5b35;box-shadow:0 16px 50px #18352a20}input,button{box-sizing:border-box;width:100%;padding:10px;margin:8px 0}button{border:0;background:#18352a;color:white}</style></head><body><form class="box" method="post"><h1>Operator login</h1><p>Use the Portainer <code>MANAGEMENT_TOKEN</code>.</p><input name="token" type="password" autocomplete="current-password" required autofocus><button>Open dashboard</button></form></body></html>"""
 
@@ -95,6 +143,10 @@ def create_app(
             raise UnknownToolError(f"unknown tool: {name}")
         identity = _identity_from_request(request, config, replay_store)
         require_scope(identity, TOOL_SCOPES[name])
+        if not os.path.isfile(config.google_credentials_file):
+            raise UpstreamError(
+                "google service account not configured; upload the key via /admin"
+            )
         return await upstream.call(name, arguments)
 
     session_manager = StreamableHTTPSessionManager(
@@ -135,12 +187,29 @@ def create_app(
         return JSONResponse(
             {
                 "ok": True,
-                "credentials_file_mounted": os.path.isfile(
-                    config.google_credentials_file
-                ),
+                "credentials": _credentials_meta(config.google_credentials_file),
                 "tool_count": len(TOOL_SCOPES),
             }
         )
+
+    async def admin_credentials(request: Request) -> JSONResponse:
+        if not _dashboard_authorized(request, config):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        payload = await request.body()
+        try:
+            meta = _validate_service_account(payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        target = config.google_credentials_file
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+        except OSError as exc:
+            return JSONResponse({"error": f"cannot write key file: {exc}"},
+                                status_code=500)
+        return JSONResponse({"installed": True, **meta})
 
     async def admin_logout(_: Request):
         response = RedirectResponse("/admin/login", status_code=303)
@@ -168,6 +237,7 @@ def create_app(
         Route("/admin", admin_dashboard, methods=["GET"]),
         Route("/admin/logout", admin_logout, methods=["GET"]),
         Route("/api/admin/status", admin_status, methods=["GET"]),
+        Route("/api/admin/credentials", admin_credentials, methods=["POST"]),
         Mount("/mcp", app=mcp_endpoint),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)

@@ -24,10 +24,13 @@ any mutation operations.
 
 `https://<final-hostname>/admin` is a deliberately small status and setup
 dashboard. Log in using the independent `MANAGEMENT_TOKEN` configured in
-Portainer. It confirms only whether the service-account file is mounted and
-whether the closed GA tool catalog loaded; it never displays, edits, or exports
-pairing values, Google keys, or GA property data. Runtime configuration remains
-declarative in Portainer so every change is auditable.
+Portainer. It reports whether the service-account key is installed (client
+email + project id only — never key material), accepts an upload of the
+`service_account` JSON key (validated, written `0600` under `/data/secrets`),
+and shows the closed GA tool catalog. The connector boots in a degraded state
+without the key so the dashboard can receive it; MCP tool calls are rejected
+until the file exists. Pairing values and the key itself are never displayed,
+edited, or exported.
 
 ## Security Contract
 
@@ -52,11 +55,12 @@ personal refresh token in Portainer.
    email with **Viewer** (reports) or **Analyst** (explorations/funnels) on
    each property the connector may read. Prefer property-level access, never
    Account Administrator unless a GA Admin API read requires it.
-5. Save its JSON only on the Portainer host under the stack's `DATA_DIR`:
-   `${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json`
-   (mounted read-only at `/data/secrets/...` inside the container),
-   owned by root, mode `0600`. Never commit, paste into the Hub, or add to a
-   client MCP configuration.
+5. Install the key one of two ways:
+   - **Dashboard (easiest):** log in at `/admin` and upload the JSON — it is
+     validated (`type=service_account`, required fields) and written `0600` to
+     `${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json`.
+   - **Host shell:** place it there yourself, owned by root, mode `0600`.
+   Never commit, paste into the Hub, or add to a client MCP configuration.
 6. Set `GOOGLE_APPLICATION_CREDENTIALS` to the mounted read-only file path.
 
 If the official upstream later gains a secure device/OAuth credential store,

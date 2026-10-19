@@ -18,12 +18,11 @@ services:
       MANAGEMENT_TOKEN: ${MANAGEMENT_TOKEN:-}
     volumes:
       # DATA_DIR is the host root entered in Portainer; stable host storage,
-      # no named volumes. Mounted read-only: the connector is stateless and
-      # must not be able to modify its own service-account credential.
+      # no named volumes. Writable only for /data/secrets: the operator
+      # dashboard uploads the service-account key through this mount.
       - type: bind
         source: ${DATA_DIR:-/home/Docker}/google-analytics-connector
         target: /data
-        read_only: true
     # Nginx Proxy Manager (on the separate proxy host) reaches this LAN-only
     # port. Do not publish it to WAN/firewall rules.
     ports:
