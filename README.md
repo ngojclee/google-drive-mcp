@@ -53,7 +53,8 @@ personal refresh token in Portainer.
    each property the connector may read. Prefer property-level access, never
    Account Administrator unless a GA Admin API read requires it.
 5. Save its JSON only on the Portainer host under the stack's `DATA_DIR`:
-   `${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json`,
+   `${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json`
+   (mounted read-only at `/data/secrets/...` inside the container),
    owned by root, mode `0600`. Never commit, paste into the Hub, or add to a
    client MCP configuration.
 6. Set `GOOGLE_APPLICATION_CREDENTIALS` to the mounted read-only file path.
@@ -106,7 +107,7 @@ restart anything.
    GA_PRIVATE_MCP_URL=https://<hostname>/mcp
    GA_ALLOWED_HOSTS=<hostname>
    GA_HOST_PORT=3444
-   GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/google-analytics-service-account.json
+   GOOGLE_APPLICATION_CREDENTIALS=/data/secrets/google-analytics-service-account.json
    GOOGLE_PROJECT_ID=<optional>
    MANAGEMENT_TOKEN=<unique-32+-character-operator-password>
    ```

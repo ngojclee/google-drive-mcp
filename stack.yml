@@ -12,15 +12,17 @@ services:
       GA_ALLOWED_HOSTS: ${GA_ALLOWED_HOSTS:-}
       GA_BIND_HOST: 0.0.0.0
       GA_BIND_PORT: 3050
-      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-analytics-service-account.json
+      DATA_DIR: /data
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/data/secrets/google-analytics-service-account.json}
       GOOGLE_PROJECT_ID: ${GOOGLE_PROJECT_ID:-}
       MANAGEMENT_TOKEN: ${MANAGEMENT_TOKEN:-}
     volumes:
-      # DATA_DIR is the host root entered in Portainer. Docker resolves this
-      # bind mount on the host before the service starts.
+      # DATA_DIR is the host root entered in Portainer; stable host storage,
+      # no named volumes. Mounted read-only: the connector is stateless and
+      # must not be able to modify its own service-account credential.
       - type: bind
-        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json
-        target: /run/secrets/google-analytics-service-account.json
+        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector
+        target: /data
         read_only: true
     # Nginx Proxy Manager (on the separate proxy host) reaches this LAN-only
     # port. Do not publish it to WAN/firewall rules.
