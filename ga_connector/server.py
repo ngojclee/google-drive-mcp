@@ -18,6 +18,7 @@ from starlette.routing import Mount, Route
 
 from ga_connector import __version__
 from ga_connector.config import GaConnectorConfig
+from ga_connector.icon import FAVICON_SVG
 from ga_connector.delegation import (
     DelegatedIdentity,
     DelegationError,
@@ -82,9 +83,10 @@ def _validate_service_account(payload: bytes) -> dict[str, Any]:
 
 _DASHBOARD_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/admin/favicon.svg">
 <title>Google Analytics Connector</title>
-<style>body{margin:0;background:#f2f5f2;color:#18352a;font:16px Georgia,serif}.shell{max-width:800px;margin:8vh auto;padding:36px;background:#fffdf7;box-shadow:0 16px 50px #18352a20;border-top:6px solid #cf5b35}h1{margin-top:0}.card{padding:18px;margin:16px 0;background:#e8f0e8;border-left:4px solid #2f7053}code{background:#dbe9de;padding:2px 5px}button{background:#18352a;color:white;border:0;padding:10px 16px;cursor:pointer}.muted{color:#52675c}</style>
-</head><body><main class="shell"><h1>Google Analytics Connector</h1>
+<style>body{margin:0;background:#f2f5f2;color:#18352a;font:16px Georgia,serif}.shell{max-width:800px;margin:8vh auto;padding:36px;background:#fffdf7;box-shadow:0 16px 50px #18352a20;border-top:6px solid #cf5b35}h1{margin-top:0}.card{padding:18px;margin:16px 0;background:#e8f0e8;border-left:4px solid #2f7053}code{background:#dbe9de;padding:2px 5px}button{background:#18352a;color:white;border:0;padding:10px 16px;cursor:pointer}.muted{color:#52675c}img.brand{width:44px;height:44px;border-radius:10px;vertical-align:-14px;margin-right:8px}</style>
+</head><body><main class="shell"><h1><img class="brand" src="/admin/favicon.svg" alt=""> Google Analytics Connector</h1>
 <p class="muted">Read-only operator status. Runtime secrets stay in Portainer; this page cannot display or modify them.</p>
 <div class="card" id="status">Loading connector status...</div>
 <h2>Service-account key</h2>
@@ -101,7 +103,8 @@ up.onclick=()=>{const f=fi.files[0];if(!f)return;f.text().then(t=>fetch('/api/ad
 load();
 </script></body></html>"""
 
-_LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connector login</title><style>body{background:#f2f5f2;font:16px Georgia,serif;color:#18352a}.box{max-width:360px;margin:20vh auto;background:#fffdf7;padding:32px;border-top:6px solid #cf5b35;box-shadow:0 16px 50px #18352a20}input,button{box-sizing:border-box;width:100%;padding:10px;margin:8px 0}button{border:0;background:#18352a;color:white}</style></head><body><form class="box" method="post"><h1>Operator login</h1><p>Use the Portainer <code>MANAGEMENT_TOKEN</code>.</p><input name="token" type="password" autocomplete="current-password" required autofocus><button>Open dashboard</button></form></body></html>"""
+_LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" type="image/svg+xml" href="/admin/favicon.svg">
+<title>Connector login</title><style>body{background:#f2f5f2;font:16px Georgia,serif;color:#18352a}.box{max-width:360px;margin:20vh auto;background:#fffdf7;padding:32px;border-top:6px solid #cf5b35;box-shadow:0 16px 50px #18352a20}input,button{box-sizing:border-box;width:100%;padding:10px;margin:8px 0}button{border:0;background:#18352a;color:white}</style></head><body><form class="box" method="post"><h1><img src="/admin/favicon.svg" alt="" width="36" height="36" style="border-radius:8px;vertical-align:-8px;margin-right:6px">Operator login</h1><p>Use the Portainer <code>MANAGEMENT_TOKEN</code>.</p><input name="token" type="password" autocomplete="current-password" required autofocus><button>Open dashboard</button></form></body></html>"""
 
 def _identity_from_request(
     request: Request,
@@ -211,6 +214,15 @@ def create_app(
                                 status_code=500)
         return JSONResponse({"installed": True, **meta})
 
+    async def favicon(_: Request) -> Any:
+        from starlette.responses import Response
+
+        return Response(
+            FAVICON_SVG,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     async def admin_logout(_: Request):
         response = RedirectResponse("/admin/login", status_code=303)
         response.delete_cookie(_DASHBOARD_COOKIE, path="/")
@@ -233,6 +245,7 @@ def create_app(
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
+        Route("/admin/favicon.svg", favicon, methods=["GET"]),
         Route("/admin/login", admin_login, methods=["GET", "POST"]),
         Route("/admin", admin_dashboard, methods=["GET"]),
         Route("/admin/logout", admin_logout, methods=["GET"]),
