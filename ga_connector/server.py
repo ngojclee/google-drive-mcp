@@ -111,6 +111,12 @@ def _identity_from_request(
     config: GaConnectorConfig,
     replay_store: NonceReplayStore,
 ) -> DelegatedIdentity:
+    # The MCP SDK resolves tools/list internally to validate tools/call —
+    # both handlers see the same HTTP request. Verify + consume the nonce
+    # once per request, then reuse the identity.
+    cached = getattr(request.state, "_delegated_identity", None)
+    if cached is not None:
+        return cached
     identity = verify_delegation_headers(
         headers=request.headers,
         secret=config.hub_delegation_secret,
@@ -119,6 +125,7 @@ def _identity_from_request(
     )
     # Optional app binding: when the Hub pins a connector record to an app id,
     # require the signed envelope to carry it.
+    request.state._delegated_identity = identity
     return identity
 
 
@@ -137,7 +144,11 @@ def create_app(
         request = mcp_server.request_context.request
         identity = _identity_from_request(request, config, replay_store)
         require_scope(identity, "ga:read")
-        return await upstream.list_tools()
+        tools = await upstream.list_tools()
+        # Advertise only what the caller's scopes can actually invoke — a
+        # ga:read-only client never sees write/admin tool names.
+        granted = frozenset(identity.scopes)
+        return [t for t in tools if TOOL_SCOPES.get(t.name) in granted]
 
     @mcp_server.call_tool(validate_input=False)
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[Any]:

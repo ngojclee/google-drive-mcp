@@ -7,7 +7,7 @@ from starlette.testclient import TestClient
 
 from ga_connector.config import GaConnectorConfig
 from ga_connector.server import _dashboard_signature, create_app
-from ga_connector.upstream import UpstreamGa
+from ga_connector.upstream import TOOL_SCOPES, UpstreamGa
 from ga_connector.delegation import canonical_delegation
 
 
@@ -80,7 +80,7 @@ class HttpBoundaryTests(unittest.TestCase):
                 cookies={"ga_connector_admin": _dashboard_signature("d" * 40)},
             )
             self.assertEqual(allowed.status_code, 200)
-            self.assertEqual(allowed.json()["tool_count"], 9)
+            self.assertEqual(allowed.json()["tool_count"], len(TOOL_SCOPES))
 
     def test_scoped_tool_discovery_works(self):
         app = create_app(config(), UpstreamGa(FakeCoordinator()))

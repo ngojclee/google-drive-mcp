@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 
+from ga_connector.admin_api import ADMIN_TOOLS
 from ga_connector.upstream import TOOL_SCOPES, UnknownToolError, UpstreamGa
 
 
@@ -21,7 +22,10 @@ class UpstreamTests(unittest.TestCase):
     def test_unclassified_tools_are_hidden_and_denied(self):
         proxy = UpstreamGa(FakeCoordinator())
         tools = asyncio.run(proxy.list_tools())
-        self.assertEqual([tool.name for tool in tools], ["get_account_summaries"])
+        self.assertEqual(
+            [tool.name for tool in tools],
+            ["get_account_summaries"] + list(ADMIN_TOOLS),
+        )
         with self.assertRaises(UnknownToolError):
             asyncio.run(proxy.call("unclassified", {}))
 
@@ -36,4 +40,5 @@ class UpstreamTests(unittest.TestCase):
             "run_realtime_report",
             "run_funnel_report",
             "run_conversions_report",
+            *ADMIN_TOOLS,
         })

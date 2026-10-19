@@ -2,9 +2,11 @@
 
 The app-owned boundary between Business MCP Hub and the official
 [`analytics-mcp`](https://github.com/googleanalytics/google-analytics-mcp)
-package. It exposes only Google Analytics 4 read tools through Streamable HTTP:
+package, plus Admin API configuration tools implemented in
+`ga_connector/admin_api.py`. Tool visibility follows the caller's delegated
+scopes — a `ga:read`-only identity never sees write/admin tools:
 
-| Upstream tool | Required scope |
+| Tool | Required scope |
 | --- | --- |
 | `get_account_summaries` | `ga:read` |
 | `list_google_ads_links` | `ga:read` |
@@ -15,10 +17,21 @@ package. It exposes only Google Analytics 4 read tools through Streamable HTTP:
 | `run_realtime_report` | `ga:read` |
 | `run_funnel_report` | `ga:read` |
 | `run_conversions_report` | `ga:read` |
+| `list_data_streams` | `ga:write` |
+| `list_key_events` / `create_key_event` / `update_key_event` / `delete_key_event` | `ga:write` |
+| `list_custom_dimensions` / `create_custom_dimension` / `archive_custom_dimension` | `ga:write` |
+| `list_custom_metrics` / `create_custom_metric` / `archive_custom_metric` | `ga:write` |
+| `update_property` | `ga:write` |
+| `list_channel_groups` | `ga:write` |
+| `list_measurement_protocol_secrets` / `create_measurement_protocol_secret` / `delete_measurement_protocol_secret` | `ga:write` |
+| `list_access_bindings` / `create_access_binding` / `delete_access_binding` | `ga:admin` |
+| `search_change_history` | `ga:admin` |
 
-Business MCP Hub publishes those as `google_analytics__<tool>`. The connector
-does not expose account configuration, OAuth, arbitrary Google API calls, or
-any mutation operations.
+Business MCP Hub publishes those as `google_analytics__<tool>`. `ga:write`
+maps to the GA4 **Editor** property role and `ga:admin` to **Administrator**;
+Google-side permission failures surface as tool errors (see
+`docs/ga4-setup-playbook.md` for the role matrix). The connector does not
+expose account creation, OAuth, or arbitrary Google API calls.
 
 ## Operator Dashboard
 
@@ -80,13 +93,13 @@ restart anything.
    endpoint:         https://<final-hostname>/mcp
    health endpoint:  https://<final-hostname>/health
    audience:         google-analytics
-   allowed scopes:   ga:read
+   allowed scopes:   ga:read   (+ ga:write / ga:admin only when those
+                     surfaces should be reachable — see the tool table)
    ```
 
-   Add the nine-tool catalog above with `required_scopes: ["ga:read"]` for
-   each tool. Copy the connector bearer and delegation secret from the
-   one-time pairing reveal into Portainer in the next step. Do not enable or
-   test the route yet.
+   Copy the connector bearer and delegation secret from the one-time pairing
+   reveal into Portainer in the next step. Do not enable or test the route
+   yet.
 2. On `https://10.21.4.101:9443`, create a Stack in **Repository** mode:
 
    ```text

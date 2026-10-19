@@ -25,10 +25,11 @@ SCOPE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._*-]{0,63}$")
 
 # Tool-facing scope groups. Hub registry client grants carry these strings;
 # the connector re-checks them so a misconfigured grant cannot widen a
-# caller silently. All GA4 tools are reads — a single scope covers the
-# catalog today; split before any future mutation tool exists.
+# caller silently.
 READ_SCOPE = "ga:read"
-KNOWN_SCOPES = frozenset({READ_SCOPE})
+WRITE_SCOPE = "ga:write"   # GA4 Editor role: property-config writes/reads
+ADMIN_SCOPE = "ga:admin"   # GA4 Administrator role: access bindings + audit
+KNOWN_SCOPES = frozenset({READ_SCOPE, WRITE_SCOPE, ADMIN_SCOPE})
 
 
 def parse_client_id(value: Any) -> str:
