@@ -23,6 +23,10 @@ services:
       - type: bind
         source: ${DATA_DIR:-/home/Docker}/google-analytics-connector
         target: /data
+        read_only: true
+      - type: bind
+        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets
+        target: /data/secrets
     # Nginx Proxy Manager (on the separate proxy host) reaches this LAN-only
     # port. Do not publish it to WAN/firewall rules.
     ports:
