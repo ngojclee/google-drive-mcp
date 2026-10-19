@@ -16,19 +16,18 @@ services:
       GOOGLE_PROJECT_ID: ${GOOGLE_PROJECT_ID:-}
       MANAGEMENT_TOKEN: ${MANAGEMENT_TOKEN:-}
     volumes:
+      # DATA_DIR is the host root entered in Portainer. Docker resolves this
+      # bind mount on the host before the service starts.
       - type: bind
-        source: ${GA_SERVICE_ACCOUNT_PATH:-/home/Docker/google-analytics-connector/secrets/google-analytics-service-account.json}
+        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets/google-analytics-service-account.json
         target: /run/secrets/google-analytics-service-account.json
         read_only: true
-    expose:
-      - "3050"
     # Nginx Proxy Manager (on the separate proxy host) reaches this LAN-only
     # port. Do not publish it to WAN/firewall rules.
     ports:
       - "${GA_HOST_PORT:-3444}:3050"
     networks:
-      - app_internal
-      - proxy
+      - business-mcp
     security_opt:
       - no-new-privileges:true
     read_only: true
@@ -42,9 +41,6 @@ services:
       start_period: 15s
 
 networks:
-  app_internal:
-    internal: true
-  proxy:
+  # Shared Docker network already used by Business MCP Hub connectors.
+  business-mcp:
     external: true
-    # Change to the existing Portainer reverse-proxy network name.
-    name: CHANGE_ME_PROXY_NETWORK
