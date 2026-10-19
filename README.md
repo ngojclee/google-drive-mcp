@@ -16,6 +16,11 @@ Connect an MCP client to Google Drive, Docs, Sheets, Slides, and Calendar throug
 
 This project remains focused on deep Drive and editor workflows rather than attempting to expose every Google Workspace API.
 
+## Sub-apps in this repo
+
+- `src/connector/` + `Dockerfile.connector` → **google-workspace-connector** image (`apps/google-workspace-connector`)
+- `connectors/google-analytics/` → **google-analytics-connector** (Python, GA4 Admin API; merged in via git subtree — history preserved; former standalone repo `apps/google-analytics-connector` is superseded)
+
 ## Client compatibility
 
 Compatibility is determined by the transport and authentication flow a client supports.
