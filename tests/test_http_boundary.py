@@ -74,7 +74,7 @@ class HttpBoundaryTests(unittest.TestCase):
                 follow_redirects=False,
             )
             self.assertEqual(login.status_code, 303)
-            self.assertEqual(client.get("/api/admin/status").status_code, 401)
+            self.assertEqual(client.get("/api/admin/status").status_code, 200)
             allowed = client.get(
                 "/api/admin/status",
                 cookies={"ga_connector_admin": _dashboard_signature("d" * 40)},

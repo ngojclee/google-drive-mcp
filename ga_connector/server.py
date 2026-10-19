@@ -173,7 +173,7 @@ def create_app(
             _DASHBOARD_COOKIE,
             _dashboard_signature(config.management_token),
             httponly=True,
-            secure=True,
+            secure=request.url.scheme == "https",
             samesite="strict",
             path="/",
         )
