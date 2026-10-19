@@ -67,19 +67,8 @@ application-default login` files into an image.
 This repository intentionally supplies a template only; it does not deploy or
 restart anything.
 
-1. Deploy in Portainer **Repository** mode from this canonical Gitea
-   repository. It builds source with `stack.yml`; no registry image is needed.
-2. In the Portainer Stack environment panel, enter the values from
-   `.env.example` — pairing values revealed once by Business MCP Hub,
-   `MANAGEMENT_TOKEN`, final HTTPS hostname, and optional project id. The
-   compose file explicitly passes each variable to the container.
-3. Create an NPM/reverse-proxy host for the final hostname, upstream
-   `http://10.21.4.101:3444`, with a certificate whose SAN includes the
-   hostname. `GA_HOST_PORT` defaults to `3444`; restrict it to LAN/proxy
-   access and do not add WAN/firewall exposure.
-4. Deploy the stack **without adding any Hub route yet**. Verify
-   `GET /health` through the internal network and exact HTTPS hostname.
-5. In Business MCP Hub `/admin`, create a **disabled** connector:
+1. Choose the final HTTPS hostname, then open Business MCP Hub
+   `http://10.21.4.101:8790/admin` and create a **disabled** connector:
 
    ```text
    namespace:       google_analytics
@@ -90,7 +79,40 @@ restart anything.
    ```
 
    Add the nine-tool catalog above with `required_scopes: ["ga:read"]` for
-   each tool. Copy pairing bearer + delegation secret once into the host env.
+   each tool. Copy the connector bearer and delegation secret from the
+   one-time pairing reveal into Portainer in the next step. Do not enable or
+   test the route yet.
+2. On `https://10.21.4.101:9443`, create a Stack in **Repository** mode:
+
+   ```text
+   Repository URL: https://gitea.lengoc.me/apps/google-analytics-connector.git
+   Reference:      refs/heads/main
+   Compose path:   stack.yml
+   Authentication: leave empty (the internal Gitea repository is public)
+   ```
+
+   Portainer builds source with `stack.yml`; no registry image is needed.
+3. In the Portainer Stack environment panel, enter the values from
+   `.env.example` — pairing values revealed once by Business MCP Hub,
+   `MANAGEMENT_TOKEN`, final HTTPS hostname, and optional project id. The
+   compose file explicitly passes each variable to the container.
+   The required names are:
+
+   ```text
+   GA_MCP_BEARER_TOKEN
+   GA_HUB_DELEGATION_SECRET
+   GA_HUB_AUDIENCE=google-analytics
+   GA_PRIVATE_MCP_URL=https://<hostname>/mcp
+   GA_ALLOWED_HOSTS=<hostname>
+   MANAGEMENT_TOKEN=<unique-32+-character-operator-password>
+   GA_SERVICE_ACCOUNT_PATH=/home/Docker/google-analytics-connector/secrets/google-analytics-service-account.json
+   ```
+4. Create an NPM/reverse-proxy host for the final hostname, upstream
+   `http://10.21.4.101:3444`, with a certificate whose SAN includes the
+   hostname. `GA_HOST_PORT` defaults to `3444`; restrict it to LAN/proxy
+   access and do not add WAN/firewall exposure.
+5. Deploy the stack while the Hub route remains disabled. Verify
+   `GET /health` through the internal network and exact HTTPS hostname.
 6. Use **Test** while disabled: certificate, `/health`, authenticated MCP
    initialize, tools/list, then negative bearer/signature/scope/replay cases.
 7. Only after an approved agent receives `ga:read`, enable the connector and
