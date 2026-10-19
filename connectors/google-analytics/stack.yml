@@ -1,0 +1,51 @@
+services:
+  google-analytics-connector:
+    # Portainer Repository mode builds this source from canonical Gitea.
+    # Do not add `image:` here: Portainer would attempt a registry pull first.
+    build: .
+    restart: unless-stopped
+    environment:
+      GA_MCP_BEARER_TOKEN: ${GA_MCP_BEARER_TOKEN:-}
+      GA_HUB_DELEGATION_SECRET: ${GA_HUB_DELEGATION_SECRET:-}
+      GA_HUB_AUDIENCE: ${GA_HUB_AUDIENCE:-google-analytics}
+      GA_PRIVATE_MCP_URL: ${GA_PRIVATE_MCP_URL:-}
+      GA_ALLOWED_HOSTS: ${GA_ALLOWED_HOSTS:-}
+      GA_BIND_HOST: 0.0.0.0
+      GA_BIND_PORT: 3050
+      DATA_DIR: /data
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/data/secrets/google-analytics-service-account.json}
+      GOOGLE_PROJECT_ID: ${GOOGLE_PROJECT_ID:-}
+      MANAGEMENT_TOKEN: ${MANAGEMENT_TOKEN:-}
+    volumes:
+      # DATA_DIR is the host root entered in Portainer; stable host storage,
+      # no named volumes. Writable only for /data/secrets: the operator
+      # dashboard uploads the service-account key through this mount.
+      - type: bind
+        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector
+        target: /data
+        read_only: true
+      - type: bind
+        source: ${DATA_DIR:-/home/Docker}/google-analytics-connector/secrets
+        target: /data/secrets
+    # Nginx Proxy Manager (on the separate proxy host) reaches this LAN-only
+    # port. Do not publish it to WAN/firewall rules.
+    ports:
+      - "${GA_HOST_PORT:-3444}:3050"
+    networks:
+      - business-mcp
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3050/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  # Shared Docker network already used by Business MCP Hub connectors.
+  business-mcp:
+    external: true
