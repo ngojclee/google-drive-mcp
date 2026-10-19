@@ -52,12 +52,12 @@ def _port(name: str, default: int) -> int:
 def _csv(name: str) -> tuple[str, ...]:
     raw = os.getenv(name, "").strip()
     items = {p.strip() for p in raw.split(",") if p.strip()}
+    if not items:
+        raise RuntimeError(f"{name} is required (comma-separated hostnames)")
     # Loopback + container-internal names must always be allowed: the Docker
     # healthcheck and in-cluster probes hit 127.0.0.1/localhost, which are
     # never operator-facing hostnames.
     items.update({"127.0.0.1", "localhost", "::1"})
-    if not items:
-        raise RuntimeError(f"{name} is required (comma-separated hostnames)")
     return tuple(sorted(items))
 
 
