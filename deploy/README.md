@@ -75,7 +75,7 @@ This is not the Google access token or refresh token.
      --mount type=bind,src=/home/Docker/google-drive-mcp/config,dst=/config \
      -e GOOGLE_DRIVE_MCP_AUTH_PORT=3300 \
      -e GOOGLE_DRIVE_MCP_SCOPES=drive.file,documents,spreadsheets,presentations,gmail.readonly \
-     gitea.lengoc.me/automations/google-drive-mcp:TESTED_TAG auth --no-browser
+     gitea.lengoc.me/apps/google-drive-mcp:TESTED_TAG auth --no-browser
    ```
 
    For drafts, append `,gmail.compose` both here and in `GOOGLE_MCP_SCOPES`.
@@ -101,7 +101,7 @@ Google consent or Gmail access. Do not create a real draft as a healthcheck.
 ## Portainer variables
 
 ```ini
-GOOGLE_MCP_IMAGE=gitea.lengoc.me/automations/google-drive-mcp:TESTED_TAG
+GOOGLE_MCP_IMAGE=gitea.lengoc.me/apps/google-drive-mcp:TESTED_TAG
 GOOGLE_MCP_ALLOWED_HOSTS=10.21.4.101
 GOOGLE_MCP_SCOPES=drive.file,documents,spreadsheets,presentations,gmail.readonly
 ```

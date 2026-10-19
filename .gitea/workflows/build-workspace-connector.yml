@@ -43,8 +43,9 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$IMAGE_TAG" =~ ^[0-9][A-Za-z0-9_.-]{0,127}$ ]] || exit 1
-          IMAGE=gitea.lengoc.me/automations/google-workspace-connector
+          IMAGE=gitea.lengoc.me/apps/google-workspace-connector
           if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then echo 'Immutable tag exists'; exit 1; fi
-          docker build -f Dockerfile.connector --label "org.opencontainers.image.revision=${{ gitea.sha }}" --label "org.opencontainers.image.version=$IMAGE_TAG" --label "org.opencontainers.image.source=${{ gitea.server_url }}/${{ gitea.repository }}" -t "$IMAGE:$IMAGE_TAG" .
+          docker build -f Dockerfile.connector --label "org.opencontainers.image.revision=${{ gitea.sha }}" --label "org.opencontainers.image.version=$IMAGE_TAG" --label "org.opencontainers.image.source=${{ gitea.server_url }}/${{ gitea.repository }}" -t "$IMAGE:$IMAGE_TAG" -t "$IMAGE:lnc-latest" .
           docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:lnc-latest"
           docker manifest inspect "$IMAGE:$IMAGE_TAG"

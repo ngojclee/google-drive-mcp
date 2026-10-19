@@ -25,7 +25,7 @@ concurrency:
 
 env:
   REGISTRY: gitea.lengoc.me
-  IMAGE: gitea.lengoc.me/automations/google-drive-mcp
+  IMAGE: gitea.lengoc.me/apps/google-drive-mcp
   UPSTREAM: https://github.com/piotr-agier/google-drive-mcp.git
   NODE_OPTIONS: --max-old-space-size=2048
 
@@ -113,7 +113,7 @@ jobs:
       - name: Merge release into fork and publish lnc image
         if: steps.image.outputs.exists != 'true' || gitea.event.inputs.lnc_rebuild == 'true'
         env:
-          GITEA_PUSH_URL: https://louis:${{ secrets.REGISTRY_TOKEN }}@gitea.lengoc.me/automations/google-drive-mcp.git
+          GITEA_PUSH_URL: https://louis:${{ secrets.REGISTRY_TOKEN }}@gitea.lengoc.me/apps/google-drive-mcp.git
           CYGNUS_URL: ${{ secrets.CYGNUS_GATEWAY_URL }}
           CYGNUS_TOKEN: ${{ secrets.CYGNUS_GATEWAY_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -153,7 +153,7 @@ jobs:
           cd ..
 
           docker build \
-            --label "org.opencontainers.image.source=https://gitea.lengoc.me/automations/google-drive-mcp" \
+            --label "org.opencontainers.image.source=https://gitea.lengoc.me/apps/google-drive-mcp" \
             --label "org.opencontainers.image.revision=${revision}" \
             --label "org.opencontainers.image.version=${lnc_tag}" \
             -t "${{ env.IMAGE }}:${lnc_tag}" \

@@ -3,7 +3,7 @@ name: Build upstream master edge (Gitea)
 # Ported from .github/workflows/sync-upstream-and-build-edge.yml.
 # Differences vs GitHub version:
 #   - plain shell instead of actions/* (works on self-hosted act_runner + dind)
-#   - pushes to gitea.lengoc.me/automations/google-drive-mcp, not GHCR
+#   - pushes to gitea.lengoc.me/apps/google-drive-mcp, not GHCR
 #   - DOCKER_HOST is injected by the runner envs (fleet-ci-docker dind)
 
 on:
@@ -23,7 +23,7 @@ concurrency:
 
 env:
   REGISTRY: gitea.lengoc.me
-  IMAGE: gitea.lengoc.me/automations/google-drive-mcp
+  IMAGE: gitea.lengoc.me/apps/google-drive-mcp
   UPSTREAM: https://github.com/piotr-agier/google-drive-mcp.git
   NODE_OPTIONS: --max-old-space-size=2048
 

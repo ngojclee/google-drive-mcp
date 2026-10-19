@@ -2,7 +2,7 @@ name: google-drive-mcp
 
 services:
   google-drive-mcp:
-    image: ${GOOGLE_MCP_IMAGE:-gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.ui.20261019.1}
+    image: ${GOOGLE_MCP_IMAGE:-gitea.lengoc.me/apps/google-drive-mcp:2.12.0-lnc.ui.20261019.1}
     pull_policy: always
     container_name: google-drive-mcp
     restart: unless-stopped

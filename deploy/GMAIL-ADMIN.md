@@ -29,7 +29,7 @@
      --mount type=bind,src=/home/Docker/google-drive-mcp/config,dst=/config \
      -e GOOGLE_DRIVE_MCP_AUTH_PORT=3300 \
      -e GOOGLE_DRIVE_MCP_SCOPES=drive,drive.file,drive.readonly,documents,spreadsheets,presentations,calendar,calendar.events,gmail.readonly \
-     gitea.lengoc.me/automations/google-drive-mcp:2.12.0-lnc.gmail.20261016.1 auth --no-browser
+     gitea.lengoc.me/apps/google-drive-mcp:2.12.0-lnc.gmail.20261016.1 auth --no-browser
    ```
 
    For draft creation, append `,gmail.compose` to the scope env above. These

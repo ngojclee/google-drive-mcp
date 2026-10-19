@@ -24,7 +24,7 @@ concurrency:
 
 env:
   REGISTRY: gitea.lengoc.me
-  IMAGE: gitea.lengoc.me/automations/google-drive-mcp
+  IMAGE: gitea.lengoc.me/apps/google-drive-mcp
   NODE_OPTIONS: --max-old-space-size=3072
 
 jobs:
