@@ -260,7 +260,15 @@ def create_app(
         async with session_manager.run():
             yield
 
+    async def root_redirect(_: Request):
+        return RedirectResponse("/admin", status_code=303)
+
+    async def login_html_redirect(_: Request):
+        return RedirectResponse("/admin/login", status_code=303)
+
     routes = [
+        Route("/", root_redirect, methods=["GET"]),
+        Route("/login.html", login_html_redirect, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/admin/favicon.svg", favicon, methods=["GET"]),
