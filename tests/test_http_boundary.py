@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import time
 import unittest
 
 from starlette.testclient import TestClient
@@ -5,11 +8,35 @@ from starlette.testclient import TestClient
 from ga_connector.config import GaConnectorConfig
 from ga_connector.server import create_app
 from ga_connector.upstream import UpstreamGa
+from ga_connector.delegation import canonical_delegation
 
 
 class FakeCoordinator:
     async def list_tools(self):
         return []
+
+
+def headers(nonce: str):
+    timestamp = int(time.time())
+    payload = canonical_delegation(
+        audience="google-analytics",
+        client_id="codex-10-11-1-1",
+        timestamp=timestamp,
+        nonce=nonce,
+        scopes="ga:read",
+    )
+    return {
+        "authorization": "Bearer " + ("b" * 40),
+        "content-type": "application/json",
+        "accept": "application/json",
+        "x-mcp-hub-client-id": "codex-10-11-1-1",
+        "x-mcp-hub-client-scopes": "ga:read",
+        "x-mcp-hub-client-timestamp": str(timestamp),
+        "x-mcp-hub-client-nonce": nonce,
+        "x-mcp-hub-client-signature": hmac.new(
+            ("c" * 40).encode(), payload, hashlib.sha256
+        ).hexdigest(),
+    }
 
 
 def config():
@@ -35,3 +62,19 @@ class HttpBoundaryTests(unittest.TestCase):
             self.assertEqual(health.json()["service"], "ga-connector")
             denied = client.post("/mcp", json={})
             self.assertEqual(denied.status_code, 401)
+
+    def test_scoped_tool_discovery_works(self):
+        app = create_app(config(), UpstreamGa(FakeCoordinator()))
+        with TestClient(app) as client:
+            response = client.post(
+                "/mcp",
+                headers=headers("A" * 24),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["result"]["tools"], [])
