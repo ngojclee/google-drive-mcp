@@ -239,14 +239,21 @@ def create_app(
         response.delete_cookie(_DASHBOARD_COOKIE, path="/")
         return response
 
-    async def mcp_endpoint(scope: Any, receive: Any, send: Any) -> None:
-        request = Request(scope)
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {config.mcp_bearer_token}":
-            response = JSONResponse({"error": "unauthorized"}, status_code=401)
-            await response(scope, receive, send)
-            return
-        await session_manager.handle_request(scope, receive, send)
+    class _McpApp:
+        """ASGI wrapper: Route() serves the session manager at exactly /mcp
+        (a Mount would 307-redirect bare /mcp to /mcp/ and Hub clients lose
+        the request on the redirect). Mount stays for /mcp/... subpaths."""
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            request = Request(scope)
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {config.mcp_bearer_token}":
+                response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+            await session_manager.handle_request(scope, receive, send)
+
+    mcp_app = _McpApp()
 
     @asynccontextmanager
     async def lifespan(_: Any):
@@ -262,7 +269,8 @@ def create_app(
         Route("/admin/logout", admin_logout, methods=["GET"]),
         Route("/api/admin/status", admin_status, methods=["GET"]),
         Route("/api/admin/credentials", admin_credentials, methods=["POST"]),
-        Mount("/mcp", app=mcp_endpoint),
+        Route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"]),
+        Mount("/mcp", app=mcp_app),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(config.allowed_hosts))
